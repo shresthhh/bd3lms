@@ -12,6 +12,7 @@
 #SBATCH --gres=gpu:1                  # Type/number of GPUs needed
 #SBATCH --open-mode=append            # Do not overwrite logs
 #SBATCH --requeue                     # Requeue upon preemption
+#SBATCH --account= cse585f25_class
 
 LENGTH=$1
 SEED=$2
