@@ -12,7 +12,7 @@
 #SBATCH --gres=gpu:4                  # Type/number of GPUs needed
 #SBATCH --open-mode=append            # Do not overwrite logs
 #SBATCH --requeue                     # Requeue upon preemption
-#SBATCH --account= cse585f25_class
+#SBATCH --account=cse585f25_class
 
 BLOCK_SIZE=16
 PRETRAIN_CKPT=/share/kuleshov/ma2238/textdiffusion/checkpoints/lm1b_wrap_pretrain/checkpoints/61-850000.ckpt
