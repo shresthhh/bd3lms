@@ -8,7 +8,7 @@
 #SBATCH -t 08:00:00                   # Time limit (hh:mm:ss)
 #SBATCH --partition=gpu               # Request partition
 #SBATCH --ntasks-per-node=4
-#SBATCH --gres=gpu:4                  # Type/number of GPUs needed
+#SBATCH --gres=gpu:1                  # Type/number of GPUs needed
 #SBATCH --open-mode=append            # Do not overwrite logs
 #SBATCH --requeue                     # Requeue upon preemption
 #SBATCH --account=cse585f25_class
