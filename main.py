@@ -90,6 +90,15 @@ def generate_samples(config, logger, tokenizer):
   if config.eval.disable_ema:
     logger.info('Disabling EMA.')
     model.ema = None
+  
+  # Enable benchmarking if requested via env var or config
+  benchmark_tag = os.environ.get('BD3LM_BENCHMARK_TAG', None)
+  if benchmark_tag is None and hasattr(config, 'benchmark_tag'):
+    benchmark_tag = config.benchmark_tag
+  if benchmark_tag:
+    logger.info(f'Enabling benchmark with tag: {benchmark_tag}')
+    model.enable_benchmark(tag=benchmark_tag)
+  
   text_samples = model.restore_model_and_sample(
     num_steps=config.algo.T)
   print('Text samples:', text_samples)

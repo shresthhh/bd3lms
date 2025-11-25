@@ -14,21 +14,22 @@
 #SBATCH --requeue                     # Requeue upon preemption
 
 BLOCK_SIZE=16
-PRETRAIN_CKPT=/share/kuleshov/ma2238/textdiffusion/checkpoints/lm1b_wrap_pretrain/checkpoints/61-850000.ckpt
+# Train from scratch (set to HuggingFace checkpoint path to finetune)
+PRETRAIN_CKPT=null
 
 python -u main.py \
-    loader.global_batch_size=512 \
-    loader.eval_global_batch_size=512 \
-    loader.batch_size=64 \
-    loader.eval_batch_size=64 \
+    loader.global_batch_size=32 \
+    loader.eval_global_batch_size=32 \
+    loader.batch_size=8 \
+    loader.eval_batch_size=8 \
     model=small \
     algo=bd3lm \
     algo.clip_search_widths=[0.5,0.6,0.7,0.8,0.9] \
     data=lm1b-wrap \
     model.length=128 \
     block_size=${BLOCK_SIZE} \
-    wandb.name=bd3lm-lm1b-block_size${BLOCK_SIZE} \
+    wandb=null \
     mode=train \
-    model.attn_backend=flex \
+    model.attn_backend=sdpa \
     training.resample=True \
     training.from_pretrained=$PRETRAIN_CKPT

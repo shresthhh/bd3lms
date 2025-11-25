@@ -18,6 +18,13 @@ import utils
 import numpy as np
 import itertools
 
+# Benchmarking support
+try:
+    from benchmark import InferenceBenchmark, create_benchmark
+    BENCHMARK_AVAILABLE = True
+except ImportError:
+    BENCHMARK_AVAILABLE = False
+
 def _sample_categorical(categorical_probs):
   gumbel_norm = (1e-10 - (torch.rand_like(categorical_probs) + 1e-10).log())
   samples = (categorical_probs / gumbel_norm).argmax(dim=-1)
@@ -113,6 +120,10 @@ class Diffusion(L.LightningModule):
     self.fast_forward_epochs = None
     self.fast_forward_batches = None
     self._validate_configuration()
+    
+    # Benchmarking support
+    self.benchmark = None
+    self._benchmark_enabled = False
 
   def _get_parameters(self):
     parameters = [self.backbone.parameters(),
@@ -147,6 +158,21 @@ class Diffusion(L.LightningModule):
       assert self.config.model.attn_backend != 'flex', 'FlexAttention mask not supported at inference.'
     if self.config.model.attn_backend == 'flex':
       assert self.config.algo.name == 'bd3lm', 'Custom FlexAttention mask only supported for BD3LM.'
+
+  def enable_benchmark(self, tag: str = "baseline"):
+    """Enable benchmarking for inference timing."""
+    if BENCHMARK_AVAILABLE:
+      self.benchmark = create_benchmark(self.config)
+      self._benchmark_enabled = True
+      self._benchmark_tag = tag
+      print(f"[Benchmark] Enabled with tag: {tag}")
+    else:
+      print("[Benchmark] benchmark.py not found, benchmarking disabled")
+  
+  def disable_benchmark(self):
+    """Disable benchmarking."""
+    self._benchmark_enabled = False
+    self.benchmark = None
       
   def to(self, *args, **kwargs):
     self = super().to(*args, **kwargs) 
@@ -719,6 +745,20 @@ class Diffusion(L.LightningModule):
       self.config.model.length,
       self.config.loader.eval_batch_size,
       self.device)
+    
+    # Finalize and save benchmark if enabled
+    if self._benchmark_enabled and self.benchmark and samples:
+      gen_ppl = self.metrics.gen_ppl.compute().item() if hasattr(self.metrics, 'gen_ppl') else 0.0
+      final_entropy = self.metrics.entropy.compute().item() if hasattr(self.metrics, 'entropy') else 0.0
+      
+      benchmark_metrics = self.benchmark.end_inference(
+        generated_text=samples[0] if samples else "",
+        generative_ppl=gen_ppl,
+        final_entropy=final_entropy,
+      )
+      self.benchmark.print_summary(benchmark_metrics)
+      self.benchmark.save_metrics(benchmark_metrics, tag=self._benchmark_tag)
+      
     return samples
 
   def get_score(self, x, sigma):
@@ -995,7 +1035,15 @@ class Diffusion(L.LightningModule):
     if self.config.sampling.kv_cache:
       self.backbone.reset_kv_cache(eval_batch_size=self.config.loader.eval_batch_size)
 
+    # Start benchmark timing
+    if self._benchmark_enabled and self.benchmark:
+      self.benchmark.start_inference()
+
     for stride_num in tqdm(range(num_strides)):
+      # Start block timing
+      if self._benchmark_enabled and self.benchmark:
+        self.benchmark.start_block()
+      
       # sample next block
       if stride_num == 0:
         x_accum = self._sample_prior(n_samples, self.block_size).to(self.device)
@@ -1038,8 +1086,16 @@ class Diffusion(L.LightningModule):
             p_x0=p_x0_cache,)
         if p_x0_cache is None:
           sampling_steps += 1
+          # Record diffusion step for benchmark
+          if self._benchmark_enabled and self.benchmark:
+            self.benchmark.record_diffusion_step()
        
         x_accum[:, fwd_idx] = x_next
+
+      # End block timing and record metrics
+      if self._benchmark_enabled and self.benchmark:
+        block_tokens = x_accum[:, -self.block_size:].flatten()
+        self.benchmark.end_block(block_tokens)
 
       # check if we need to resample (or stop sampling for variable-length sampling)
       if x_accum.shape[1] > 256:
