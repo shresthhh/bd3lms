@@ -1112,7 +1112,43 @@ class Diffusion(L.LightningModule):
     entropy = torch.special.entr(counts.float() / counts.sum()).sum()
     return entropy
   
-  def _check_stop_conds(self, x):
+def _compute_complexity(self, x, ngram_size=2):
+    """
+    Compute a complexity score for the last block of tokens using only the current sample.
+    
+    Args:
+        x: torch.Tensor, current sample, shape [batch, seq_len]
+        ngram_size: int, size of n-grams for textual diversity
+
+    Returns:
+        complexity_score: torch.Tensor, higher = more complex
+    """
+    # Take last 256 tokens
+    last_block = x[:, -256:]
+
+    # 1️⃣ Shannon entropy of token distribution
+    _, counts = torch.unique(last_block, return_counts=True)
+    entropy = torch.special.entr(counts.float() / counts.sum()).sum()
+
+    # 2️⃣ N-gram entropy (measures repeated patterns)
+    ngrams = []
+    for b in range(last_block.shape[0]):
+        seq = last_block[b].tolist()
+        ngrams_b = [tuple(seq[i:i+ngram_size]) for i in range(len(seq)-ngram_size+1)]
+        ngrams.extend(ngrams_b)
+    if ngrams:
+        ngrams_tensor = torch.tensor([hash(g) for g in ngrams], device=x.device)
+        _, counts_ng = torch.unique(ngrams_tensor, return_counts=True)
+        ngram_entropy = torch.special.entr(counts_ng.float() / counts_ng.sum()).sum()
+    else:
+        ngram_entropy = torch.tensor(0.0, device=x.device)
+
+    # Combine metrics (weights can be tuned)
+    alpha, beta = 0.7, 0.3
+    complexity_score = alpha * entropy + beta * ngram_entropy
+    return complexity_score
+  
+def _check_stop_conds(self, x):
     """Check if sampling should stop based on 1) eos, 2) entropy, or 3) likelihood.
     Entropy/likelihood evaluated on last 256 token-block.
     
@@ -1142,6 +1178,13 @@ class Diffusion(L.LightningModule):
 
       # CRITERION 2: stop if entropy/likelihood is low
       if entropy < 4:
+        stop = True
+        truncate_idx = x.shape[1] - 256
+      
+    # 3. Complexity check
+    complexity_score = self._compute_complexity(x)
+    complexity_threshold = 1.0  # tune this
+    if complexity_score < complexity_threshold:
         stop = True
         truncate_idx = x.shape[1] - 256
 
