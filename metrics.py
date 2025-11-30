@@ -230,3 +230,75 @@ class Metrics:
 
       # record sample length
       self.gen_lengths.append(valid_tokens_accum.sum().detach().cpu().item())
+
+  @torch.no_grad()
+  def record_block_efficiency_ratio(
+      self,
+      text_samples: typing.List[str],
+      nfes_per_block: int,
+      num_blocks: int,
+      max_length: int = 1024,
+      device: str = 'cuda'
+  ) -> dict:
+    """
+    Computes Block Efficiency Ratio (BER) = Quality / Computational Cost
+    """
+    # Compute quality using existing gen_ppl infrastructure
+    self.record_generative_perplexity(
+        text_samples=text_samples,
+        max_length=max_length,
+        device=device
+    )
+    
+    # Get the perplexity
+    gen_ppl = self.gen_ppl.compute().item()
+    quality_score = 1.0 / gen_ppl
+    
+    # Compute computational cost
+    total_nfes = nfes_per_block * num_blocks
+    
+    # BER: quality per unit computation
+    ber = quality_score / total_nfes
+    
+    result = {
+        'block_efficiency_ratio': ber,
+        'quality_score': quality_score,
+        'generative_perplexity': gen_ppl,
+        'total_nfes': total_nfes,
+        'nfes_per_block': nfes_per_block,
+        'num_blocks': num_blocks
+    }
+    
+    return result
+
+  @torch.no_grad()
+  def record_time_to_first_block(
+      self,
+      generation_times: typing.List[float],
+      block_size: int,
+      model_length: int
+  ) -> dict:
+    """
+    Computes Time-to-First-Block metrics from generation timings
+    """
+    import numpy as np
+    
+    avg_gen_time = np.mean(generation_times)
+    num_blocks = model_length // block_size
+    
+    # Approximate time to first block
+    time_per_block = avg_gen_time / num_blocks
+    time_to_first_block_ms = time_per_block * 1000
+    
+    # Throughput
+    throughput = model_length / avg_gen_time
+    
+    result = {
+        'time_to_first_block_ms': float(time_to_first_block_ms),
+        'time_per_block_ms': float(time_per_block * 1000),
+        'avg_generation_time_s': float(avg_gen_time),
+        'throughput_tokens_per_sec': float(throughput),
+        'block_size': int(block_size)
+    }
+    
+    return result

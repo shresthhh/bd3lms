@@ -11,6 +11,10 @@ import transformers
 import dataloader
 import diffusion
 import utils
+import tqdm
+import time
+import json
+from pathlib import Path
 
 omegaconf.OmegaConf.register_new_resolver(
   'cwd', os.getcwd)
@@ -149,6 +153,146 @@ def _ppl_eval(config, logger, tokenizer):
     config, tokenizer, skip_train=True, valid_seed=seed)
   trainer.validate(model, valid_ds)
 
+def _block_metrics_eval(config, logger, tokenizer):
+  """Evaluate block-specific metrics."""
+  logger.info('Starting Block Metrics Evaluation.')
+  
+  # Load model
+  model = _load_from_checkpoint(config=config, tokenizer=tokenizer)
+  
+  if config.eval.disable_ema:
+    logger.info('Disabling EMA.')
+    model.ema = None
+  
+  model.eval()
+  
+  results = {}
+  device = 'cuda' if torch.cuda.is_available() else 'cpu'
+  
+  # Get number of samples to generate
+  num_samples = config.eval.get('num_samples', 10)
+  batch_size = config.loader.eval_batch_size
+  num_batches = (num_samples + batch_size - 1) // batch_size  # Ceiling division
+  
+  logger.info(f'Generating {num_samples} samples in {num_batches} batches...')
+  
+  text_samples = []
+  generation_times = []
+  batch_indices = list(range(num_batches))
+
+  for batch_idx in tqdm(batch_indices,desc='Generating batches'):
+    start_time = time.time()
+    
+    # Generate a batch of samples
+    # restore_model_and_sample generates batch_size_per_gpu samples
+    batch_samples = model.restore_model_and_sample(
+      num_steps=config.algo.T,
+      seqlen=config.model.length
+    )
+    
+    elapsed = time.time() - start_time
+    
+    # Track timing per sample in batch
+    samples_in_batch = len(batch_samples) if isinstance(batch_samples, list) else 1
+    time_per_sample = elapsed / samples_in_batch
+    
+    for _ in range(samples_in_batch):
+      generation_times.append(time_per_sample)
+    
+    # Collect samples
+    if isinstance(batch_samples, list):
+      text_samples.extend(batch_samples)
+    else:
+      text_samples.append(batch_samples)
+    
+    # Stop if we have enough samples
+    if len(text_samples) >= num_samples:
+      break
+  
+  # Trim to exact number requested
+  text_samples = text_samples[:num_samples]
+  generation_times = generation_times[:num_samples]
+  
+  logger.info(f'Generated {len(text_samples)} samples.')
+  
+  # Compute Block Efficiency Ratio
+  logger.info('Computing Block Efficiency Ratio...')
+  
+  num_blocks = config.model.length // config.block_size
+  
+  # Reset metrics before computing
+  model.metrics.gen_ppl.reset()
+  model.metrics.gen_entropy.reset()
+  
+  ber_result = model.metrics.record_block_efficiency_ratio(
+      text_samples=text_samples,
+      nfes_per_block=config.algo.T,
+      num_blocks=num_blocks,
+      max_length=config.model.length,
+      device=device
+  )
+  results['block_efficiency_ratio'] = ber_result
+  
+  logger.info(f'Block Efficiency Ratio: {ber_result["block_efficiency_ratio"]:.8f}')
+  logger.info(f'Generative Perplexity: {ber_result["generative_perplexity"]:.2f}')
+  
+  # Compute Time to First Block
+  logger.info('Computing Time to First Block...')
+  
+  ttfb_result = model.metrics.record_time_to_first_block(
+      generation_times=generation_times,
+      block_size=config.block_size,
+      model_length=config.model.length
+  )
+  results['time_to_first_block'] = ttfb_result
+  
+  logger.info(f'Time to First Block: {ttfb_result["time_to_first_block_ms"]:.2f} ms')
+  logger.info(f'Throughput: {ttfb_result["throughput_tokens_per_sec"]:.1f} tokens/sec')
+  
+  # Save results
+  output_dir = Path('results')
+  output_dir.mkdir(exist_ok=True)
+  
+  output_file = output_dir / f'block_metrics_bs{config.block_size}.json'
+  
+  # Add config info to results
+  results['config'] = {
+      'block_size': config.block_size,
+      'model_length': config.model.length,
+      'num_samples': len(text_samples),
+      'diffusion_steps': config.algo.T,
+      'checkpoint': config.eval.checkpoint_path
+  }
+  
+  with open(output_file, 'w') as f:
+    json.dump(results, f, indent=2)
+  
+  logger.info(f'Results saved to: {output_file}')
+  
+  # Print summary
+  print('\n' + '='*80)
+  print('BLOCK METRICS SUMMARY')
+  print('='*80)
+  print(f'Checkpoint: {config.eval.checkpoint_path}')
+  print(f'Block Size: {config.block_size}')
+  print(f'Samples Generated: {len(text_samples)}')
+  print(f'Model Length: {config.model.length}')
+  print(f'Diffusion Steps (T): {config.algo.T}')
+  print(f'\nGENERATIVE QUALITY:')
+  print(f'  Perplexity: {ber_result["generative_perplexity"]:.2f}')
+  print(f'  Quality Score: {ber_result["quality_score"]:.6f}')
+  print(f'\nEFFICIENCY METRICS:')
+  print(f'  Block Efficiency Ratio: {ber_result["block_efficiency_ratio"]:.8f}')
+  print(f'  Total NFEs: {ber_result["total_nfes"]}')
+  print(f'  NFEs per Block: {ber_result["nfes_per_block"]}')
+  print(f'\nSPEED METRICS:')
+  print(f'  Time to First Block: {ttfb_result["time_to_first_block_ms"]:.2f} ms')
+  print(f'  Avg Generation Time: {ttfb_result["avg_generation_time_s"]:.2f} s')
+  print(f'  Throughput: {ttfb_result["throughput_tokens_per_sec"]:.1f} tokens/sec')
+  print('='*80 + '\n')
+  
+  return results
+
 def _train(config, logger, tokenizer):
   logger.info('Starting Training.')
   wandb_logger = None
@@ -227,6 +371,9 @@ def main(config):
   elif config.mode == 'ppl_eval':
     config.wandb = None
     _ppl_eval(config, logger, tokenizer)
+  elif config.mode == 'block_metrics_eval':
+    config.wandb = None
+    results = _block_metrics_eval(config, logger, tokenizer)
   else:
     _train(config, logger, tokenizer)
 
