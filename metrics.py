@@ -8,6 +8,8 @@ import os
 import torch.nn.functional as F
 from tqdm import tqdm
 import math
+import numpy as np 
+from collections import Counter
 
 LOG2 = torch.log(torch.tensor(2.0))
 
@@ -281,7 +283,6 @@ class Metrics:
     """
     Computes Time-to-First-Block metrics from generation timings
     """
-    import numpy as np
     
     avg_gen_time = np.mean(generation_times)
     num_blocks = model_length // block_size
@@ -302,3 +303,370 @@ class Metrics:
     }
     
     return result
+
+  @torch.no_grad()
+  def record_block_variance_analysis(
+      self,
+      text_samples: typing.List[str],
+      block_size: int,
+      model_length: int,
+      device: str = 'cuda'
+  ) -> dict:
+    """
+    Analyzes variance in quality across different blocks within sequences.
+    High variance suggests inconsistent generation quality.
+    """
+    os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+    eval_model = transformers.AutoModelForCausalLM.from_pretrained(
+        self.gen_ppl_eval_model_name_or_path).eval()
+    if 'llama2' not in self.gen_ppl_eval_model_name_or_path:
+      eval_model = eval_model.to(device)
+    
+    samples, attn_mask, _ = self._eval_retokenize(
+        text_samples, max_length=model_length, device=device)
+    
+    num_blocks = model_length // block_size
+    block_ppls = []
+    
+    # Compute perplexity for each block position
+    for block_idx in range(num_blocks):
+      start = block_idx * block_size
+      end = (block_idx + 1) * block_size
+      
+      block_samples = samples[:, start:end]
+      block_attn = attn_mask[:, start:end]
+      
+      with torch.no_grad():
+        logits = eval_model(block_samples, attention_mask=block_attn)[0]
+        logits = logits.transpose(-1, -2)
+        
+        nlls = F.cross_entropy(logits[..., :-1], block_samples[..., 1:], reduction='none')
+        valid_tokens = (block_samples[..., 1:] != self.tokenizer.eos_token_id).to(torch.float)
+        
+        avg_nll = (nlls * valid_tokens).sum() / valid_tokens.sum()
+        block_ppl = torch.exp(avg_nll).item()
+        block_ppls.append(block_ppl)
+    
+    result = {
+        'block_ppl_mean': float(np.mean(block_ppls)),
+        'block_ppl_std': float(np.std(block_ppls)),
+        'block_ppl_min': float(np.min(block_ppls)),
+        'block_ppl_max': float(np.max(block_ppls)),
+        'block_ppl_range': float(np.max(block_ppls) - np.min(block_ppls)),
+        'block_ppl_cv': float(np.std(block_ppls) / (np.mean(block_ppls) + 1e-10)),
+        'per_block_ppls': [float(p) for p in block_ppls],
+        'degradation_trend': float(np.corrcoef(range(len(block_ppls)), block_ppls)[0, 1])
+    }
+    
+    return result
+
+  @torch.no_grad()
+  def record_sampling_efficiency_curve(
+      self,
+      samples_by_steps: typing.Dict[int, typing.List[str]],
+      steps_list: typing.List[int],
+      model_length: int,
+      device: str = 'cuda'
+  ) -> dict:
+    """
+    Analyzes quality vs sampling steps to find optimal T.
+    Identifies diminishing returns and optimal operating points.
+    """
+    results = []
+    
+    for T in steps_list:
+      samples = samples_by_steps[T]
+      
+      # Reset and compute PPL
+      self.gen_ppl.reset()
+      self.record_generative_perplexity(
+          text_samples=samples,
+          max_length=model_length,
+          device=device
+      )
+      
+      ppl = self.gen_ppl.compute().item()
+      
+      results.append({
+          'diffusion_steps': int(T),
+          'perplexity': float(ppl),
+          'quality_improvement_per_step': 0.0  # Will compute after
+      })
+    
+    # Compute marginal improvements
+    for i in range(1, len(results)):
+      ppl_improvement = results[i-1]['perplexity'] - results[i]['perplexity']
+      step_difference = results[i]['diffusion_steps'] - results[i-1]['diffusion_steps']
+      results[i]['quality_improvement_per_step'] = float(ppl_improvement / step_difference)
+    
+    # Find knee point (max marginal improvement)
+    improvements = [r['quality_improvement_per_step'] for r in results[1:]]
+    if improvements:
+      knee_idx = np.argmax(improvements) + 1
+      optimal_T = results[knee_idx]['diffusion_steps']
+    else:
+      optimal_T = steps_list[-1]
+    
+    return {
+        'efficiency_curve': results,
+        'optimal_T': int(optimal_T),
+        'min_ppl_T': int(min(results, key=lambda x: x['perplexity'])['diffusion_steps']),
+        'diminishing_returns_threshold': float(np.mean(improvements) if improvements else 0.0)
+    }
+
+  @torch.no_grad()
+  def record_length_robustness(
+      self,
+      samples_by_length: typing.Dict[int, typing.List[str]],
+      lengths: typing.List[int],
+      device: str = 'cuda'
+  ) -> dict:
+    """
+    Tests model performance across different sequence lengths.
+    Important for validating arbitrary-length generation.
+    """
+    results = []
+    
+    for length in lengths:
+      samples = samples_by_length[length]
+      
+      self.gen_ppl.reset()
+      self.record_generative_perplexity(
+          text_samples=samples,
+          max_length=length,
+          device=device
+      )
+      
+      ppl = self.gen_ppl.compute().item()
+      
+      results.append({
+          'sequence_length': int(length),
+          'perplexity': float(ppl),
+          'ppl_normalized': float(ppl / (length / 1024))  # Normalize to 1024 tokens
+      })
+    
+    ppls = [r['perplexity'] for r in results]
+    lengths_arr = [r['sequence_length'] for r in results]
+    
+    # Check if quality degrades with length
+    correlation = np.corrcoef(lengths_arr, ppls)[0, 1]
+    
+    return {
+        'length_robustness_curve': results,
+        'length_ppl_correlation': float(correlation),
+        'ppl_std_across_lengths': float(np.std(ppls)),
+        'maintains_quality': bool(correlation < 0.3)  # Low correlation = robust
+    }
+
+  @torch.no_grad()
+  def record_token_level_confidence(
+      self,
+      text_samples: typing.List[str],
+      model_length: int,
+      block_size: int,
+      device: str = 'cuda'
+  ) -> dict:
+    """
+    Analyzes model confidence at token level across blocks.
+    Lower entropy = higher confidence.
+    """
+    os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+    eval_model = transformers.AutoModelForCausalLM.from_pretrained(
+        self.gen_ppl_eval_model_name_or_path).eval()
+    if 'llama2' not in self.gen_ppl_eval_model_name_or_path:
+      eval_model = eval_model.to(device)
+    
+    samples, attn_mask, _ = self._eval_retokenize(
+        text_samples, max_length=model_length, device=device)
+    
+    num_blocks = model_length // block_size
+    block_confidences = []
+    
+    for block_idx in range(num_blocks):
+      start = block_idx * block_size
+      end = (block_idx + 1) * block_size
+      
+      block_samples = samples[:, start:end]
+      block_attn = attn_mask[:, start:end]
+      
+      with torch.no_grad():
+        logits = eval_model(block_samples, attention_mask=block_attn)[0]
+        probs = F.softmax(logits, dim=-1)
+        
+        # Compute entropy (uncertainty) for each position
+        entropies = -(probs * torch.log(probs + 1e-10)).sum(dim=-1)
+        avg_entropy = entropies.mean().item()
+        
+        # Top-1 probability (confidence)
+        top1_probs = probs.max(dim=-1)[0]
+        avg_confidence = top1_probs.mean().item()
+        
+        block_confidences.append({
+            'block_idx': block_idx,
+            'avg_entropy': float(avg_entropy),
+            'avg_confidence': float(avg_confidence)
+        })
+    
+    entropies = [b['avg_entropy'] for b in block_confidences]
+    confidences = [b['avg_confidence'] for b in block_confidences]
+    
+    return {
+        'per_block_confidence': block_confidences,
+        'overall_avg_entropy': float(np.mean(entropies)),
+        'overall_avg_confidence': float(np.mean(confidences)),
+        'entropy_std': float(np.std(entropies)),
+        'confidence_std': float(np.std(confidences)),
+        'first_block_confidence': float(confidences[0]) if confidences else 0.0,
+        'last_block_confidence': float(confidences[-1]) if confidences else 0.0
+    }
+
+  @torch.no_grad()
+  def record_repetition_metrics(
+      self,
+      text_samples: typing.List[str],
+      n_gram_sizes: typing.List[int] = [2, 3, 4]
+  ) -> dict:
+    """
+    Measures repetition at different n-gram levels.
+    High repetition indicates mode collapse or poor diversity.
+    """
+    def get_ngrams(tokens, n):
+      return [tuple(tokens[i:i+n]) for i in range(len(tokens)-n+1)]
+    
+    results = {}
+    
+    for n in n_gram_sizes:
+      all_ngrams = []
+      unique_ratios = []
+      max_repetitions = []
+      
+      for sample in text_samples:
+        tokens = self.tokenizer.encode(sample, add_special_tokens=False)
+        ngrams = get_ngrams(tokens, n)
+        
+        if not ngrams:
+          continue
+        
+        all_ngrams.extend(ngrams)
+        
+        # Unique ratio for this sample
+        unique_ratio = len(set(ngrams)) / len(ngrams)
+        unique_ratios.append(unique_ratio)
+        
+        # Max repetition count
+        ngram_counts = Counter(ngrams)
+        max_rep = max(ngram_counts.values()) if ngram_counts else 1
+        max_repetitions.append(max_rep)
+      
+      # Overall statistics
+      overall_ngram_counts = Counter(all_ngrams)
+      overall_unique_ratio = len(set(all_ngrams)) / len(all_ngrams) if all_ngrams else 0
+      
+      results[f'{n}gram'] = {
+          'unique_ratio_mean': float(np.mean(unique_ratios)) if unique_ratios else 0.0,
+          'unique_ratio_std': float(np.std(unique_ratios)) if unique_ratios else 0.0,
+          'max_repetition_mean': float(np.mean(max_repetitions)) if max_repetitions else 0.0,
+          'overall_unique_ratio': float(overall_unique_ratio),
+          'total_ngrams': len(all_ngrams),
+          'unique_ngrams': len(set(all_ngrams))
+      }
+    
+    # Repetition score (lower is better)
+    # Average across n-gram sizes
+    avg_unique_ratio = np.mean([results[f'{n}gram']['unique_ratio_mean'] for n in n_gram_sizes])
+    repetition_score = 1.0 - avg_unique_ratio
+    
+    results['summary'] = {
+        'overall_repetition_score': float(repetition_score),
+        'avg_unique_ratio': float(avg_unique_ratio),
+        'has_excessive_repetition': bool(repetition_score > 0.3)
+    }
+    
+    return results
+
+  @torch.no_grad()
+  def record_computational_breakdown(
+      self,
+      generation_times: typing.List[float],
+      block_size: int,
+      model_length: int,
+      diffusion_steps: int
+  ) -> dict:
+    """
+    Breaks down computational costs across different components.
+    Helps identify bottlenecks.
+    """
+    num_blocks = model_length // block_size
+    avg_time = np.mean(generation_times)
+    
+    # Theoretical breakdown
+    time_per_block = avg_time / num_blocks
+    time_per_diffusion_step = time_per_block / diffusion_steps
+    
+    # Compare with autoregressive baseline (sequential token generation)
+    ar_time_per_token = time_per_block / block_size  # Approximate
+    ar_total_time = ar_time_per_token * model_length
+    
+    # Speedup metrics
+    theoretical_max_speedup = block_size
+    actual_speedup = ar_total_time / avg_time if avg_time > 0 else 0
+    efficiency = (actual_speedup / theoretical_max_speedup) * 100 if theoretical_max_speedup > 0 else 0
+    
+    result = {
+        'total_generation_time_s': float(avg_time),
+        'time_per_block_ms': float(time_per_block * 1000),
+        'time_per_diffusion_step_ms': float(time_per_diffusion_step * 1000),
+        'tokens_per_second': float(model_length / avg_time) if avg_time > 0 else 0,
+        'blocks_per_second': float(num_blocks / avg_time) if avg_time > 0 else 0,
+        'diffusion_steps_per_second': float((num_blocks * diffusion_steps) / avg_time) if avg_time > 0 else 0,
+        'estimated_ar_time_s': float(ar_total_time),
+        'speedup_vs_ar': float(actual_speedup),
+        'theoretical_max_speedup': float(theoretical_max_speedup),
+        'parallel_efficiency_pct': float(efficiency),
+        'overhead_per_block_ms': float(max(0, time_per_block - (diffusion_steps * time_per_diffusion_step)) * 1000)
+    }
+    
+    return result
+
+  @torch.no_grad()
+  def record_quality_consistency(
+      self,
+      text_samples: typing.List[str],
+      model_length: int,
+      device: str = 'cuda',
+      num_runs: int = 3
+  ) -> dict:
+    """
+    Measures consistency across multiple generation runs with same config.
+    Low variance indicates stable generation.
+    """
+    run_ppls = []
+    
+    for run_idx in range(min(num_runs, len(text_samples) // 5)):
+      # Take subset for each run
+      start_idx = run_idx * (len(text_samples) // num_runs)
+      end_idx = start_idx + (len(text_samples) // num_runs)
+      run_samples = text_samples[start_idx:end_idx]
+      
+      if not run_samples:
+        continue
+      
+      self.gen_ppl.reset()
+      self.record_generative_perplexity(
+          text_samples=run_samples,
+          max_length=model_length,
+          device=device
+      )
+      
+      ppl = self.gen_ppl.compute().item()
+      run_ppls.append(ppl)
+    
+    return {
+        'ppl_mean': float(np.mean(run_ppls)) if run_ppls else 0.0,
+        'ppl_std': float(np.std(run_ppls)) if run_ppls else 0.0,
+        'ppl_min': float(np.min(run_ppls)) if run_ppls else 0.0,
+        'ppl_max': float(np.max(run_ppls)) if run_ppls else 0.0,
+        'coefficient_of_variation': float(np.std(run_ppls) / (np.mean(run_ppls) + 1e-10)) if run_ppls else 0.0,
+        'is_consistent': bool(np.std(run_ppls) < 5.0) if run_ppls else False,
+        'num_runs': len(run_ppls)
+    }

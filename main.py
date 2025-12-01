@@ -11,7 +11,7 @@ import transformers
 import dataloader
 import diffusion
 import utils
-import tqdm
+from tqdm import tqdm
 import time
 import json
 from pathlib import Path
@@ -293,6 +293,388 @@ def _block_metrics_eval(config, logger, tokenizer):
   
   return results
 
+def _comprehensive_block_metrics_eval(config, logger, tokenizer):
+  """Evaluate comprehensive block-specific metrics with all new additions."""
+  logger.info('Starting Comprehensive Block Metrics Evaluation.')
+  
+  model = _load_from_checkpoint(config=config, tokenizer=tokenizer)
+  
+  if config.eval.disable_ema:
+    logger.info('Disabling EMA.')
+    model.ema = None
+  
+  model.eval()
+  device = 'cuda' if torch.cuda.is_available() else 'cpu'
+  
+  results = {}
+  num_samples = config.eval.get('num_samples', 50)
+  batch_size = config.loader.eval_batch_size
+  num_batches = (num_samples + batch_size - 1) // batch_size
+  
+  logger.info(f'Generating {num_samples} samples in {num_batches} batches...')
+  
+  text_samples = []
+  generation_times = []
+
+  for batch_idx in tqdm.tqdm(range(num_batches), desc='Generating batches'):
+    start_time = time.time()
+    
+    batch_samples = model.restore_model_and_sample(
+      num_steps=config.algo.T,
+      seqlen=config.model.length
+    )
+    
+    elapsed = time.time() - start_time
+    
+    samples_in_batch = len(batch_samples) if isinstance(batch_samples, list) else 1
+    time_per_sample = elapsed / samples_in_batch
+    
+    for _ in range(samples_in_batch):
+      generation_times.append(time_per_sample)
+    
+    if isinstance(batch_samples, list):
+      text_samples.extend(batch_samples)
+    else:
+      text_samples.append(batch_samples)
+    
+    if len(text_samples) >= num_samples:
+      break
+  
+  text_samples = text_samples[:num_samples]
+  generation_times = generation_times[:num_samples]
+  
+  logger.info(f'Generated {len(text_samples)} samples.')
+  
+  num_blocks = config.model.length // config.block_size
+  
+  # === CORE METRICS ===
+  
+  # 1. Block Efficiency Ratio
+  logger.info('Computing Block Efficiency Ratio...')
+  model.metrics.gen_ppl.reset()
+  model.metrics.gen_entropy.reset()
+  
+  results['block_efficiency'] = model.metrics.record_block_efficiency_ratio(
+      text_samples=text_samples,
+      nfes_per_block=config.algo.T,
+      num_blocks=num_blocks,
+      max_length=config.model.length,
+      device=device
+  )
+  
+  # 2. Time to First Block
+  logger.info('Computing Time to First Block...')
+  results['time_metrics'] = model.metrics.record_time_to_first_block(
+      generation_times=generation_times,
+      block_size=config.block_size,
+      model_length=config.model.length
+  )
+  
+  # === NEW METRICS ===
+  
+  # 3. Block Variance Analysis
+  logger.info('Computing Block Variance Analysis...')
+  results['block_variance'] = model.metrics.record_block_variance_analysis(
+      text_samples=text_samples,
+      block_size=config.block_size,
+      model_length=config.model.length,
+      device=device
+  )
+  
+  # 4. Token-Level Confidence
+  logger.info('Computing Token-Level Confidence...')
+  results['token_confidence'] = model.metrics.record_token_level_confidence(
+      text_samples=text_samples,
+      model_length=config.model.length,
+      block_size=config.block_size,
+      device=device
+  )
+  
+  # 5. Repetition Metrics
+  logger.info('Computing Repetition Metrics...')
+  results['repetition'] = model.metrics.record_repetition_metrics(
+      text_samples=text_samples,
+      n_gram_sizes=[2, 3, 4]
+  )
+  
+  # 6. Computational Breakdown
+  logger.info('Computing Computational Breakdown...')
+  results['computational'] = model.metrics.record_computational_breakdown(
+      generation_times=generation_times,
+      block_size=config.block_size,
+      model_length=config.model.length,
+      diffusion_steps=config.algo.T
+  )
+  
+  # 7. Quality Consistency
+  logger.info('Computing Quality Consistency...')
+  results['consistency'] = model.metrics.record_quality_consistency(
+      text_samples=text_samples,
+      model_length=config.model.length,
+      device=device,
+      num_runs=min(3, len(text_samples) // 10)
+  )
+  
+  # Save results
+  output_dir = Path('results')
+  output_dir.mkdir(exist_ok=True)
+  
+  output_file = output_dir / f'comprehensive_metrics_bs{config.block_size}.json'
+  
+  results['config'] = {
+      'block_size': config.block_size,
+      'model_length': config.model.length,
+      'num_samples': len(text_samples),
+      'diffusion_steps': config.algo.T,
+      'checkpoint': config.eval.checkpoint_path
+  }
+  
+  with open(output_file, 'w') as f:
+    json.dump(results, f, indent=2)
+  
+  logger.info(f'Results saved to: {output_file}')
+  
+  # === COMPREHENSIVE SUMMARY ===
+  print('\n' + '='*80)
+  print('COMPREHENSIVE BD3-LM METRICS REPORT')
+  print('='*80)
+  print(f'Checkpoint: {config.eval.checkpoint_path}')
+  print(f'Configuration: Block Size={config.block_size}, Length={config.model.length}, T={config.algo.T}')
+  print(f'Samples Analyzed: {len(text_samples)}')
+  
+  print(f'\n📊 QUALITY METRICS:')
+  print(f'  Generative Perplexity: {results["block_efficiency"]["generative_perplexity"]:.2f}')
+  print(f'  Quality Score: {results["block_efficiency"]["quality_score"]:.6f}')
+  print(f'  Quality Consistency (std): {results["consistency"]["ppl_std"]:.2f}')
+  print(f'  Is Consistent: {"✓" if results["consistency"]["is_consistent"] else "✗"}')
+  
+  print(f'\n⚡ EFFICIENCY METRICS:')
+  print(f'  Block Efficiency Ratio: {results["block_efficiency"]["block_efficiency_ratio"]:.8f}')
+  print(f'  Time to First Block: {results["time_metrics"]["time_to_first_block_ms"]:.2f} ms')
+  print(f'  Throughput: {results["time_metrics"]["throughput_tokens_per_sec"]:.1f} tokens/sec')
+  print(f'  Speedup vs AR: {results["computational"]["speedup_vs_ar"]:.2f}x')
+  print(f'  Parallel Efficiency: {results["computational"]["parallel_efficiency_pct"]:.1f}%')
+  
+  print(f'\n BLOCK-LEVEL ANALYSIS:')
+  print(f'  Block PPL Mean: {results["block_variance"]["block_ppl_mean"]:.2f}')
+  print(f'  Block PPL Std: {results["block_variance"]["block_ppl_std"]:.2f}')
+  print(f'  Block PPL Range: {results["block_variance"]["block_ppl_range"]:.2f}')
+  print(f'  Quality CV: {results["block_variance"]["block_ppl_cv"]:.4f}')
+  print(f'  Degradation Trend: {results["block_variance"]["degradation_trend"]:.4f}')
+  
+  print(f'\n CONFIDENCE METRICS:')
+  print(f'  Overall Avg Confidence: {results["token_confidence"]["overall_avg_confidence"]:.4f}')
+  print(f'  Overall Avg Entropy: {results["token_confidence"]["overall_avg_entropy"]:.4f}')
+  print(f'  Confidence Std: {results["token_confidence"]["confidence_std"]:.4f}')
+  print(f'  First Block Confidence: {results["token_confidence"]["first_block_confidence"]:.4f}')
+  print(f'  Last Block Confidence: {results["token_confidence"]["last_block_confidence"]:.4f}')
+  
+  print(f'\n REPETITION ANALYSIS:')
+  print(f'  Overall Repetition Score: {results["repetition"]["summary"]["overall_repetition_score"]:.4f}')
+  print(f'  Avg Unique Ratio: {results["repetition"]["summary"]["avg_unique_ratio"]:.4f}')
+  print(f'  Has Excessive Repetition: {"⚠️ YES" if results["repetition"]["summary"]["has_excessive_repetition"] else "✓ NO"}')
+  for n in [2, 3, 4]:
+    print(f'  {n}-gram Unique Ratio: {results["repetition"][f"{n}gram"]["unique_ratio_mean"]:.4f}')
+  
+  print(f'\n  COMPUTATIONAL BREAKDOWN:')
+  print(f'  Time per Block: {results["computational"]["time_per_block_ms"]:.2f} ms')
+  print(f'  Time per Diffusion Step: {results["computational"]["time_per_diffusion_step_ms"]:.3f} ms')
+  print(f'  Blocks per Second: {results["computational"]["blocks_per_second"]:.2f}')
+  print(f'  Overhead per Block: {results["computational"]["overhead_per_block_ms"]:.2f} ms')
+  
+  print('='*80 + '\n')
+  
+  # Additional diagnostic warnings
+  if results["block_variance"]["degradation_trend"] > 0.5:
+    print("  WARNING: Significant quality degradation detected across blocks (trend > 0.5)")
+  
+  if results["repetition"]["summary"]["has_excessive_repetition"]:
+    print(" WARNING: Excessive repetition detected. Check for mode collapse.")
+  
+  if results["computational"]["parallel_efficiency_pct"] < 50:
+    print("  WARNING: Low parallel efficiency. Consider checking implementation bottlenecks.")
+  
+  if not results["consistency"]["is_consistent"]:
+    print(" WARNING: High variance in quality across runs. Results may be unstable.")
+  
+  print()
+  
+  return results
+
+
+def _sampling_efficiency_eval(config, logger, tokenizer):
+  """
+  Evaluate quality-compute tradeoff across different T values.
+  Usage: python main.py mode=sampling_efficiency_eval eval.T_values=[100,500,1000,2500,5000]
+  """
+  logger.info('Starting Sampling Efficiency Evaluation.')
+  
+  T_values = config.eval.get('T_values', [100, 500, 1000, 2500, 5000])
+  num_samples_per_T = config.eval.get('num_samples', 20)
+  
+  samples_by_steps = {}
+  device = 'cuda' if torch.cuda.is_available() else 'cpu'
+  
+  for T in T_values:
+    logger.info(f'Generating samples with T={T}')
+    
+    # Update config
+    config.algo.T = T
+    
+    # Load model
+    model = _load_from_checkpoint(config=config, tokenizer=tokenizer)
+    if config.eval.disable_ema:
+      model.ema = None
+    model.eval()
+    
+    # Generate samples
+    text_samples = []
+    batch_size = config.loader.eval_batch_size
+    num_batches = (num_samples_per_T + batch_size - 1) // batch_size
+    
+    for _ in tqdm(range(num_batches), desc=f'T={T}'):
+      batch_samples = model.restore_model_and_sample(
+          num_steps=T,
+          seqlen=config.model.length
+      )
+      if isinstance(batch_samples, list):
+        text_samples.extend(batch_samples)
+      else:
+        text_samples.append(batch_samples)
+      
+      if len(text_samples) >= num_samples_per_T:
+        break
+    
+    samples_by_steps[T] = text_samples[:num_samples_per_T]
+  
+  # Analyze efficiency curve
+  logger.info('Analyzing sampling efficiency curve...')
+  model = _load_from_checkpoint(config=config, tokenizer=tokenizer)
+  
+  results = model.metrics.record_sampling_efficiency_curve(
+      samples_by_steps=samples_by_steps,
+      steps_list=T_values,
+      model_length=config.model.length,
+      device=device
+  )
+  
+  # Save results
+  output_dir = Path('results')
+  output_dir.mkdir(exist_ok=True)
+  output_file = output_dir / f'sampling_efficiency_bs{config.block_size}.json'
+  
+  with open(output_file, 'w') as f:
+    json.dump(results, f, indent=2)
+  
+  logger.info(f'Results saved to: {output_file}')
+  
+  # Print summary
+  print('\n' + '='*80)
+  print('SAMPLING EFFICIENCY ANALYSIS')
+  print('='*80)
+  print(f'Block Size: {config.block_size}')
+  print(f'Optimal T (knee point): {results["optimal_T"]}')
+  print(f'Best Quality T: {results["min_ppl_T"]}')
+  print(f'Diminishing Returns Threshold: {results["diminishing_returns_threshold"]:.6f}')
+  
+  print('\nEfficiency Curve:')
+  print(f'{"T":<8} {"PPL":<10} {"Δ PPL/ΔT":<15}')
+  print('-' * 80)
+  for point in results['efficiency_curve']:
+    improvement = point['quality_improvement_per_step']
+    print(f'{point["diffusion_steps"]:<8} {point["perplexity"]:<10.2f} {improvement:<15.6f}')
+  print('='*80 + '\n')
+  
+  return results
+
+
+def _length_robustness_eval(config, logger, tokenizer):
+  """
+  Evaluate model performance across different sequence lengths.
+  Usage: python main.py mode=length_robustness_eval eval.test_lengths=[512,1024,2048,4096]
+  """
+  logger.info('Starting Length Robustness Evaluation.')
+  
+  test_lengths = config.eval.get('test_lengths', [512, 1024, 2048])
+  num_samples_per_length = config.eval.get('num_samples', 20)
+  
+  samples_by_length = {}
+  device = 'cuda' if torch.cuda.is_available() else 'cpu'
+  
+  for length in test_lengths:
+    logger.info(f'Generating samples of length {length}')
+    
+    # Update config
+    config.model.length = length
+    
+    # Load model
+    model = _load_from_checkpoint(config=config, tokenizer=tokenizer)
+    if config.eval.disable_ema:
+      model.ema = None
+    model.eval()
+    
+    # Generate samples
+    text_samples = []
+    batch_size = config.loader.eval_batch_size
+    num_batches = (num_samples_per_length + batch_size - 1) // batch_size
+    
+    for _ in tqdm(range(num_batches), desc=f'Length={length}'):
+      batch_samples = model.restore_model_and_sample(
+          num_steps=config.algo.T,
+          seqlen=length
+      )
+      if isinstance(batch_samples, list):
+        text_samples.extend(batch_samples)
+      else:
+        text_samples.append(batch_samples)
+      
+      if len(text_samples) >= num_samples_per_length:
+        break
+    
+    samples_by_length[length] = text_samples[:num_samples_per_length]
+  
+  # Analyze length robustness
+  logger.info('Analyzing length robustness...')
+  model = _load_from_checkpoint(config=config, tokenizer=tokenizer)
+  
+  results = model.metrics.record_length_robustness(
+      samples_by_length=samples_by_length,
+      lengths=test_lengths,
+      device=device
+  )
+  
+  # Save results
+  output_dir = Path('results')
+  output_dir.mkdir(exist_ok=True)
+  output_file = output_dir / f'length_robustness_bs{config.block_size}.json'
+  
+  with open(output_file, 'w') as f:
+    json.dump(results, f, indent=2)
+  
+  logger.info(f'Results saved to: {output_file}')
+  
+  # Print summary
+  print('\n' + '='*80)
+  print('LENGTH ROBUSTNESS ANALYSIS')
+  print('='*80)
+  print(f'Block Size: {config.block_size}')
+  print(f'Length-PPL Correlation: {results["length_ppl_correlation"]:.4f}')
+  print(f'PPL Std Across Lengths: {results["ppl_std_across_lengths"]:.2f}')
+  print(f'Maintains Quality: {"✓ YES" if results["maintains_quality"] else "✗ NO"}')
+  
+  print('\nLength Robustness Curve:')
+  print(f'{"Length":<10} {"PPL":<10} {"PPL (normalized)":<18}')
+  print('-' * 80)
+  for point in results['length_robustness_curve']:
+    print(f'{point["sequence_length"]:<10} {point["perplexity"]:<10.2f} {point["ppl_normalized"]:<18.2f}')
+  print('='*80 + '\n')
+  
+  if not results["maintains_quality"]:
+    print("WARNING: Model shows quality degradation with increased length")
+    print("   Consider: reducing max length, adjusting block size, or retraining\n")
+  
+  return results
+
 def _train(config, logger, tokenizer):
   logger.info('Starting Training.')
   wandb_logger = None
@@ -374,6 +756,12 @@ def main(config):
   elif config.mode == 'block_metrics_eval':
     config.wandb = None
     results = _block_metrics_eval(config, logger, tokenizer)
+  elif config.mode == 'sampling_efficiency_eval':
+    config.wandb = None
+    results = _sampling_efficiency_eval(config, logger, tokenizer)
+  elif config.mode == 'length_robustness_eval':
+    config.wandb = None
+    results = _length_robustness_eval(config, logger, tokenizer)
   else:
     _train(config, logger, tokenizer)
 

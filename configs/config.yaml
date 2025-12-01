@@ -8,7 +8,7 @@ defaults:
   - /lr_scheduler: constant_warmup
   - /algo: bd3lm
 
-mode: train  # train / ppl_eval / sample_eval
+mode: sample_eval  # train / ppl_eval / sample_eval
 diffusion: absorbing_state
 
 seed: 1
@@ -51,6 +51,9 @@ eval:
   compute_perplexity_on_sanity: False
   gen_ppl_eval_model_name_or_path: gpt2-large  # gpt2-large, meta-llama/Llama-2-7b-hf
   generate_samples: False
+  num_samples: 50 
+  T_values: []
+  test_lengths: []
 
 optim:
   weight_decay: 0
