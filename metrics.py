@@ -670,3 +670,331 @@ class Metrics:
         'is_consistent': bool(np.std(run_ppls) < 5.0) if run_ppls else False,
         'num_runs': len(run_ppls)
     }
+
+    ## AR Comparison Metrics
+
+  @torch.no_grad()
+  def record_ar_baseline_comparison(
+      self,
+      bd3lm_samples: typing.List[str],
+      ar_samples: typing.List[str],
+      bd3lm_times: typing.List[float],
+      ar_times: typing.List[float],
+      block_size: int,
+      model_length: int,
+      device: str = 'cuda'
+  ) -> dict:
+    """
+    Comprehensive comparison between BD3-LM and AR baseline.
+    This is CRITICAL for validating that BD3-LM actually provides benefits.
+    """
+    
+    results = {}
+    
+    # === 1. QUALITY COMPARISON ===
+    
+    # BD3-LM quality
+    self.gen_ppl.reset()
+    self.record_generative_perplexity(
+        text_samples=bd3lm_samples,
+        max_length=model_length,
+        device=device
+    )
+    bd3lm_ppl = self.gen_ppl.compute().item()
+    
+    # AR quality
+    self.gen_ppl.reset()
+    self.record_generative_perplexity(
+        text_samples=ar_samples,
+        max_length=model_length,
+        device=device
+    )
+    ar_ppl = self.gen_ppl.compute().item()
+    
+    results['quality'] = {
+        'bd3lm_ppl': float(bd3lm_ppl),
+        'ar_ppl': float(ar_ppl),
+        'ppl_ratio': float(bd3lm_ppl / ar_ppl),
+        'quality_gap_pct': float((bd3lm_ppl - ar_ppl) / ar_ppl * 100),
+        'quality_competitive': bool(bd3lm_ppl / ar_ppl < 1.15)  # Within 15%
+    }
+    
+    # === 2. SPEED COMPARISON ===
+    
+    bd3lm_avg_time = np.mean(bd3lm_times)
+    ar_avg_time = np.mean(ar_times)
+    
+    results['speed'] = {
+        'bd3lm_time_s': float(bd3lm_avg_time),
+        'ar_time_s': float(ar_avg_time),
+        'speedup': float(ar_avg_time / bd3lm_avg_time),
+        'time_saved_pct': float((ar_avg_time - bd3lm_avg_time) / ar_avg_time * 100),
+        'bd3lm_throughput': float(model_length / bd3lm_avg_time),
+        'ar_throughput': float(model_length / ar_avg_time),
+        'achieves_speedup': bool(ar_avg_time > bd3lm_avg_time)
+    }
+    
+    # === 3. LATENCY COMPARISON (CRITICAL for interactive apps) ===
+    
+    # AR must generate sequentially, so TTFB ≈ time for first token
+    ar_ttfb = ar_avg_time / model_length  # Time per token
+    
+    # BD3-LM generates first block in parallel
+    num_blocks = model_length // block_size
+    bd3lm_ttfb = bd3lm_avg_time / num_blocks
+    
+    results['latency'] = {
+        'bd3lm_ttfb_ms': float(bd3lm_ttfb * 1000),
+        'ar_ttfb_ms': float(ar_ttfb * 1000),
+        'latency_improvement': float(ar_ttfb / bd3lm_ttfb),
+        'latency_advantage_ms': float((ar_ttfb - bd3lm_ttfb) * 1000),
+        'interactive_suitable': bool(bd3lm_ttfb < 0.5)  # Under 500ms
+    }
+    
+    # === 4. EFFICIENCY COMPARISON ===
+    
+    # Quality per second of computation
+    bd3lm_quality_per_sec = (1.0 / bd3lm_ppl) / bd3lm_avg_time
+    ar_quality_per_sec = (1.0 / ar_ppl) / ar_avg_time
+    
+    results['efficiency'] = {
+        'bd3lm_quality_per_sec': float(bd3lm_quality_per_sec),
+        'ar_quality_per_sec': float(ar_quality_per_sec),
+        'efficiency_ratio': float(bd3lm_quality_per_sec / ar_quality_per_sec),
+        'better_efficiency': bool(bd3lm_quality_per_sec > ar_quality_per_sec)
+    }
+    
+    # === 5. DIVERSITY COMPARISON ===
+    
+    bd3lm_rep = self.record_repetition_metrics(bd3lm_samples, n_gram_sizes=[2, 3, 4])
+    ar_rep = self.record_repetition_metrics(ar_samples, n_gram_sizes=[2, 3, 4])
+    
+    results['diversity'] = {
+        'bd3lm_repetition_score': bd3lm_rep['summary']['overall_repetition_score'],
+        'ar_repetition_score': ar_rep['summary']['overall_repetition_score'],
+        'bd3lm_more_diverse': bool(
+            bd3lm_rep['summary']['overall_repetition_score'] < 
+            ar_rep['summary']['overall_repetition_score']
+        )
+    }
+    
+    # === 6. OVERALL VERDICT ===
+    
+    # Pareto efficiency: is BD3-LM better on at least one axis without being much worse on others?
+    faster = results['speed']['achieves_speedup']
+    quality_ok = results['quality']['quality_competitive']
+    better_latency = results['latency']['latency_improvement'] > 1.5
+    
+    results['verdict'] = {
+        'achieves_claimed_benefits': bool(faster and quality_ok),
+        'recommended_for_interactive': bool(better_latency and quality_ok),
+        'pareto_efficient': bool((faster or better_latency) and quality_ok),
+        'tradeoff_summary': self._generate_tradeoff_summary(results)
+    }
+    
+    return results
+  
+  def _generate_tradeoff_summary(self, comparison_results: dict) -> str:
+    """Generate human-readable tradeoff summary."""
+    quality_gap = comparison_results['quality']['quality_gap_pct']
+    speedup = comparison_results['speed']['speedup']
+    latency_imp = comparison_results['latency']['latency_improvement']
+    
+    if quality_gap < 5 and speedup > 1.5:
+      return "BD3-LM achieves similar quality with significant speedup"
+    elif quality_gap < 5 and latency_imp > 2:
+      return "BD3-LM achieves similar quality with much better latency"
+    elif quality_gap > 15 and speedup > 2:
+      return "BD3-LM trades some quality for substantial speed gains"
+    elif quality_gap < 0 and speedup > 1:
+      return "BD3-LM is better on both quality and speed (Pareto improvement)"
+    elif quality_gap < 10 and speedup < 1.2:
+      return "BD3-LM shows marginal benefits; tradeoff unclear"
+    else:
+      return "BD3-LM shows complex tradeoffs; see detailed metrics"
+
+  @torch.no_grad()
+  def record_streaming_capability(
+      self,
+      bd3lm_samples: typing.List[str],
+      ar_samples: typing.List[str],
+      block_size: int,
+      model_length: int,
+      bd3lm_block_times: typing.List[typing.List[float]],  # Times per block per sample
+      ar_token_times: typing.List[typing.List[float]],  # Times per token per sample
+  ) -> dict:
+    """
+    Compares streaming capabilities - critical for real-time applications.
+    AR: one token at a time
+    BD3-LM: one block at a time
+    """
+    
+    results = {}
+    num_blocks = model_length // block_size
+    
+    # === TIME TO MEANINGFUL OUTPUT ===
+    
+    # How long until user sees 10, 25, 50, 100 tokens?
+    token_thresholds = [10, 25, 50, 100]
+    
+    for threshold in token_thresholds:
+      # AR: sum token times until threshold
+      ar_time_to_threshold = []
+      for token_times in ar_token_times:
+        time_sum = sum(token_times[:threshold]) if len(token_times) >= threshold else sum(token_times)
+        ar_time_to_threshold.append(time_sum)
+      
+      # BD3-LM: sum block times until threshold tokens generated
+      bd3lm_time_to_threshold = []
+      for block_times in bd3lm_block_times:
+        blocks_needed = (threshold + block_size - 1) // block_size
+        time_sum = sum(block_times[:blocks_needed]) if len(block_times) >= blocks_needed else sum(block_times)
+        bd3lm_time_to_threshold.append(time_sum)
+      
+      results[f'time_to_{threshold}_tokens'] = {
+          'bd3lm_ms': float(np.mean(bd3lm_time_to_threshold) * 1000),
+          'ar_ms': float(np.mean(ar_time_to_threshold) * 1000),
+          'improvement': float(np.mean(ar_time_to_threshold) / np.mean(bd3lm_time_to_threshold))
+      }
+    
+    # === STREAMING VARIANCE ===
+    
+    # Measure consistency of streaming speed
+    bd3lm_block_stds = [np.std(times) for times in bd3lm_block_times]
+    ar_token_stds = [np.std(times) for times in ar_token_times]
+    
+    results['streaming_consistency'] = {
+        'bd3lm_time_variance': float(np.mean(bd3lm_block_stds)),
+        'ar_time_variance': float(np.mean(ar_token_stds)),
+        'bd3lm_more_consistent': bool(np.mean(bd3lm_block_stds) < np.mean(ar_token_stds))
+    }
+    
+    return results
+
+  @torch.no_grad()
+  def record_failure_mode_comparison(
+      self,
+      bd3lm_samples: typing.List[str],
+      ar_samples: typing.List[str],
+      model_length: int,
+      device: str = 'cuda'
+  ) -> dict:
+    """
+    Compares failure modes between BD3-LM and AR.
+    Important to show BD3-LM doesn't introduce NEW failure modes.
+    """
+    
+    results = {}
+    
+    # === 1. REPETITION COMPARISON ===
+    bd3lm_rep = self.record_repetition_metrics(bd3lm_samples)
+    ar_rep = self.record_repetition_metrics(ar_samples)
+    
+    results['repetition_comparison'] = {
+        'bd3lm_has_excessive_repetition': bd3lm_rep['summary']['has_excessive_repetition'],
+        'ar_has_excessive_repetition': ar_rep['summary']['has_excessive_repetition'],
+        'bd3lm_repetition_score': float(bd3lm_rep['summary']['overall_repetition_score']),
+        'ar_repetition_score': float(ar_rep['summary']['overall_repetition_score']),
+        'bd3lm_worse': bool(bd3lm_rep['summary']['overall_repetition_score'] > 
+                           ar_rep['summary']['overall_repetition_score'] * 1.2)
+    }
+    
+    # === 2. COHERENCE BREAKDOWN ===
+    # Check for nonsensical outputs
+    
+    def has_coherence_issues(samples):
+      issues = 0
+      for sample in samples[:min(50, len(samples))]:
+        # Simple heuristics for broken outputs
+        if len(sample.strip()) < 50:  # Too short
+          issues += 1
+        elif sample.count('.') == 0 and len(sample) > 100:  # No punctuation
+          issues += 1
+        elif len(set(sample.split())) < len(sample.split()) * 0.3:  # Too repetitive
+          issues += 1
+      return issues / min(50, len(samples))
+    
+    bd3lm_issues = has_coherence_issues(bd3lm_samples)
+    ar_issues = has_coherence_issues(ar_samples)
+    
+    results['coherence_breakdown'] = {
+        'bd3lm_issue_rate': float(bd3lm_issues),
+        'ar_issue_rate': float(ar_issues),
+        'bd3lm_more_issues': bool(bd3lm_issues > ar_issues * 1.5)
+    }
+    
+    # === 3. QUALITY VARIANCE ===
+    bd3lm_consistency = self.record_quality_consistency(bd3lm_samples, model_length, device)
+    ar_consistency = self.record_quality_consistency(ar_samples, model_length, device)
+    
+    results['consistency_comparison'] = {
+        'bd3lm_cv': float(bd3lm_consistency['coefficient_of_variation']),
+        'ar_cv': float(ar_consistency['coefficient_of_variation']),
+        'bd3lm_less_stable': bool(bd3lm_consistency['coefficient_of_variation'] > 
+                                  ar_consistency['coefficient_of_variation'] * 1.3)
+    }
+    
+    # === VERDICT ===
+    results['summary'] = {
+        'introduces_new_failure_modes': bool(
+            results['repetition_comparison']['bd3lm_worse'] or
+            results['coherence_breakdown']['bd3lm_more_issues'] or
+            results['consistency_comparison']['bd3lm_less_stable']
+        ),
+        'failure_modes_comparable': bool(
+            not results['repetition_comparison']['bd3lm_worse'] and
+            not results['coherence_breakdown']['bd3lm_more_issues'] and
+            not results['consistency_comparison']['bd3lm_less_stable']
+        )
+    }
+    
+    return results
+
+  @torch.no_grad()
+  def record_scaling_comparison(
+      self,
+      bd3lm_samples_by_length: typing.Dict[int, typing.List[str]],
+      ar_samples_by_length: typing.Dict[int, typing.List[str]],
+      lengths: typing.List[int],
+      device: str = 'cuda'
+  ) -> dict:
+    """
+    Compare how BD3-LM and AR scale with sequence length.
+    Key question: Does BD3-LM maintain advantage at longer lengths?
+    """
+    
+    results = []
+    
+    for length in lengths:
+      bd3lm_samples = bd3lm_samples_by_length[length]
+      ar_samples = ar_samples_by_length[length]
+      
+      # Quality
+      self.gen_ppl.reset()
+      self.record_generative_perplexity(bd3lm_samples, length, device=device)
+      bd3lm_ppl = self.gen_ppl.compute().item()
+      
+      self.gen_ppl.reset()
+      self.record_generative_perplexity(ar_samples, length, device=device)
+      ar_ppl = self.gen_ppl.compute().item()
+      
+      results.append({
+          'length': int(length),
+          'bd3lm_ppl': float(bd3lm_ppl),
+          'ar_ppl': float(ar_ppl),
+          'quality_gap_pct': float((bd3lm_ppl - ar_ppl) / ar_ppl * 100)
+      })
+    
+    # Analyze trends
+    lengths_arr = np.array([r['length'] for r in results])
+    gaps = np.array([r['quality_gap_pct'] for r in results])
+    
+    # Is gap growing with length?
+    correlation = np.corrcoef(lengths_arr, gaps)[0, 1]
+    
+    return {
+        'scaling_curve': results,
+        'gap_length_correlation': float(correlation),
+        'gap_grows_with_length': bool(correlation > 0.3),
+        'maintains_competitiveness': bool(all(r['quality_gap_pct'] < 20 for r in results))
+    }

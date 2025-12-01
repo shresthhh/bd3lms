@@ -316,7 +316,7 @@ def _comprehensive_block_metrics_eval(config, logger, tokenizer):
   text_samples = []
   generation_times = []
 
-  for batch_idx in tqdm.tqdm(range(num_batches), desc='Generating batches'):
+  for batch_idx in tqdm(range(num_batches), desc='Generating batches'):
     start_time = time.time()
     
     batch_samples = model.restore_model_and_sample(
@@ -675,6 +675,400 @@ def _length_robustness_eval(config, logger, tokenizer):
   
   return results
 
+def _ar_comparison_eval(config, logger, tokenizer):
+  """
+  Comprehensive comparison between BD3-LM and AR baseline.
+  CRITICAL for validating that BD3-LM provides actual benefits.
+  
+  Usage: python main.py mode=ar_comparison_eval \
+              eval.ar_checkpoint_path=<ar_model_path> \
+              block_size=4 eval.num_samples=50
+  """
+  logger.info('Starting AR Baseline Comparison.')
+  
+  device = 'cuda' if torch.cuda.is_available() else 'cpu'
+  num_samples = config.eval.get('num_samples', 50)
+  batch_size = config.loader.eval_batch_size
+  num_batches = (num_samples + batch_size - 1) // batch_size
+  
+  results = {}
+  
+  # === 1. Generate BD3-LM Samples ===
+  logger.info('Generating BD3-LM samples...')
+  
+  bd3lm_model = _load_from_checkpoint(config=config, tokenizer=tokenizer)
+  if config.eval.disable_ema:
+    bd3lm_model.ema = None
+  bd3lm_model.eval()
+  
+  bd3lm_samples = []
+  bd3lm_times = []
+  
+  for _ in tqdm(range(num_batches), desc='BD3-LM'):
+    start_time = time.time()
+    batch_samples = bd3lm_model.restore_model_and_sample(
+        num_steps=config.algo.T,
+        seqlen=config.model.length
+    )
+    elapsed = time.time() - start_time
+    
+    if isinstance(batch_samples, list):
+      bd3lm_samples.extend(batch_samples)
+      samples_in_batch = len(batch_samples)
+    else:
+      bd3lm_samples.append(batch_samples)
+      samples_in_batch = 1
+    
+    for _ in range(samples_in_batch):
+      bd3lm_times.append(elapsed / samples_in_batch)
+    
+    if len(bd3lm_samples) >= num_samples:
+      break
+  
+  bd3lm_samples = bd3lm_samples[:num_samples]
+  bd3lm_times = bd3lm_times[:num_samples]
+  
+  # === 2. Generate AR Samples ===
+  logger.info('Generating AR baseline samples...')
+  
+  # Load AR model
+  ar_checkpoint = config.eval.get('ar_checkpoint_path', None)
+  if ar_checkpoint is None:
+    logger.error('AR checkpoint path not specified. Set eval.ar_checkpoint_path')
+    return None
+  
+  config_ar = config.copy()
+  config_ar.eval.checkpoint_path = ar_checkpoint
+  config_ar.block_size = config.model.length  # AR is equivalent to block_size = length
+  
+  ar_model = _load_from_checkpoint(config=config_ar, tokenizer=tokenizer)
+  if config.eval.disable_ema:
+    ar_model.ema = None
+  ar_model.eval()
+  
+  ar_samples = []
+  ar_times = []
+  
+  for _ in tqdm(range(num_batches), desc='AR Baseline'):
+    start_time = time.time()
+    batch_samples = ar_model.restore_model_and_sample(
+        num_steps=config.algo.T,
+        seqlen=config.model.length
+    )
+    elapsed = time.time() - start_time
+    
+    if isinstance(batch_samples, list):
+      ar_samples.extend(batch_samples)
+      samples_in_batch = len(batch_samples)
+    else:
+      ar_samples.append(batch_samples)
+      samples_in_batch = 1
+    
+    for _ in range(samples_in_batch):
+      ar_times.append(elapsed / samples_in_batch)
+    
+    if len(ar_samples) >= num_samples:
+      break
+  
+  ar_samples = ar_samples[:num_samples]
+  ar_times = ar_times[:num_samples]
+  
+  # === 3. Run Comparisons ===
+  
+  logger.info('Running comprehensive comparison...')
+  
+  # Main comparison
+  results['baseline_comparison'] = bd3lm_model.metrics.record_ar_baseline_comparison(
+      bd3lm_samples=bd3lm_samples,
+      ar_samples=ar_samples,
+      bd3lm_times=bd3lm_times,
+      ar_times=ar_times,
+      block_size=config.block_size,
+      model_length=config.model.length,
+      device=device
+  )
+  
+  # Failure mode comparison
+  logger.info('Analyzing failure modes...')
+  results['failure_modes'] = bd3lm_model.metrics.record_failure_mode_comparison(
+      bd3lm_samples=bd3lm_samples,
+      ar_samples=ar_samples,
+      model_length=config.model.length,
+      device=device
+  )
+  
+  # Save results
+  output_dir = Path('results')
+  output_dir.mkdir(exist_ok=True)
+  output_file = output_dir / f'ar_comparison_bs{config.block_size}.json'
+  
+  results['config'] = {
+      'bd3lm_checkpoint': config.eval.checkpoint_path,
+      'ar_checkpoint': ar_checkpoint,
+      'block_size': config.block_size,
+      'model_length': config.model.length,
+      'num_samples': len(bd3lm_samples),
+      'diffusion_steps': config.algo.T
+  }
+  
+  with open(output_file, 'w') as f:
+    json.dump(results, f, indent=2)
+  
+  logger.info(f'Results saved to: {output_file}')
+  
+  # === COMPREHENSIVE REPORT ===
+  
+  bc = results['baseline_comparison']
+  fm = results['failure_modes']
+  
+  print('\n' + '='*80)
+  print('BD3-LM vs AUTOREGRESSIVE BASELINE COMPARISON')
+  print('='*80)
+  print(f'BD3-LM Block Size: {config.block_size}')
+  print(f'Sequence Length: {config.model.length}')
+  print(f'Samples: {len(bd3lm_samples)}')
+  
+  print(f'\n QUALITY COMPARISON:')
+  print(f'  BD3-LM PPL: {bc["quality"]["bd3lm_ppl"]:.2f}')
+  print(f'  AR PPL:     {bc["quality"]["ar_ppl"]:.2f}')
+  print(f'  Ratio:      {bc["quality"]["ppl_ratio"]:.3f}x')
+  print(f'  Gap:        {bc["quality"]["quality_gap_pct"]:+.1f}%')
+  if bc["quality"]["quality_competitive"]:
+    print(f'  Status:     ✓ Competitive (within 15%)')
+  else:
+    print(f'  Status:       Quality gap exceeds 15%')
+  
+  print(f'\n SPEED COMPARISON:')
+  print(f'  BD3-LM:     {bc["speed"]["bd3lm_time_s"]:.2f}s')
+  print(f'  AR:         {bc["speed"]["ar_time_s"]:.2f}s')
+  print(f'  Speedup:    {bc["speed"]["speedup"]:.2f}x')
+  print(f'  Time Saved: {bc["speed"]["time_saved_pct"]:.1f}%')
+  if bc["speed"]["achieves_speedup"]:
+    print(f'  Status:     ✓ Faster than AR')
+  else:
+    print(f'  Status:       Slower than AR')
+  
+  print(f'\n LATENCY COMPARISON (Time to First Output):')
+  print(f'  BD3-LM TTFB: {bc["latency"]["bd3lm_ttfb_ms"]:.1f}ms')
+  print(f'  AR TTFB:     {bc["latency"]["ar_ttfb_ms"]:.1f}ms')
+  print(f'  Improvement: {bc["latency"]["latency_improvement"]:.2f}x')
+  print(f'  Advantage:   {bc["latency"]["latency_advantage_ms"]:.1f}ms faster')
+  if bc["latency"]["interactive_suitable"]:
+    print(f'  Status:     ✓ Suitable for interactive apps')
+  else:
+    print(f'  Status:      May be too slow for real-time use')
+  
+  print(f'\n EFFICIENCY (Quality per Second):')
+  print(f'  BD3-LM:     {bc["efficiency"]["bd3lm_quality_per_sec"]:.6f}')
+  print(f'  AR:         {bc["efficiency"]["ar_quality_per_sec"]:.6f}')
+  print(f'  Ratio:      {bc["efficiency"]["efficiency_ratio"]:.3f}x')
+  if bc["efficiency"]["better_efficiency"]:
+    print(f'  Status:     ✓ More efficient than AR')
+  else:
+    print(f'  Status:       Less efficient than AR')
+  
+  print(f'\n DIVERSITY COMPARISON:')
+  print(f'  BD3-LM Repetition Score: {bc["diversity"]["bd3lm_repetition_score"]:.4f}')
+  print(f'  AR Repetition Score:     {bc["diversity"]["ar_repetition_score"]:.4f}')
+  if bc["diversity"]["bd3lm_more_diverse"]:
+    print(f'  Status:     ✓ BD3-LM more diverse')
+  else:
+    print(f'  Status:     AR more diverse')
+  
+  print(f'\n  FAILURE MODE ANALYSIS:')
+  print(f'  Repetition Issues:')
+  print(f'    BD3-LM: {"✗ Excessive" if fm["repetition_comparison"]["bd3lm_has_excessive_repetition"] else "✓ OK"}')
+  print(f'    AR:     {"✗ Excessive" if fm["repetition_comparison"]["ar_has_excessive_repetition"] else "✓ OK"}')
+  
+  print(f'  Coherence Issues:')
+  print(f'    BD3-LM: {fm["coherence_breakdown"]["bd3lm_issue_rate"]*100:.1f}%')
+  print(f'    AR:     {fm["coherence_breakdown"]["ar_issue_rate"]*100:.1f}%')
+  
+  print(f'  Quality Variance:')
+  print(f'    BD3-LM CV: {fm["consistency_comparison"]["bd3lm_cv"]:.4f}')
+  print(f'    AR CV:     {fm["consistency_comparison"]["ar_cv"]:.4f}')
+  
+  if fm["summary"]["introduces_new_failure_modes"]:
+    print(f'\n   WARNING: BD3-LM introduces new failure modes')
+  elif fm["summary"]["failure_modes_comparable"]:
+    print(f'\n  ✓ Failure modes comparable to AR')
+  
+  print(f'\n OVERALL VERDICT:')
+  print(f'  {bc["verdict"]["tradeoff_summary"]}')
+  print(f'  Achieves Claimed Benefits: {"✓ YES" if bc["verdict"]["achieves_claimed_benefits"] else "✗ NO"}')
+  print(f'  Recommended for Interactive: {"✓ YES" if bc["verdict"]["recommended_for_interactive"] else "✗ NO"}')
+  print(f'  Pareto Efficient: {"✓ YES" if bc["verdict"]["pareto_efficient"] else "✗ NO"}')
+  
+  print('='*80 + '\n')
+  
+  # === INSIGHTS ===
+  print(' INSIGHTS:')
+  
+  if bc["quality"]["quality_competitive"] and bc["speed"]["speedup"] > 1.5:
+    print('  ✓ BD3-LM successfully achieves the core goal: similar quality with speedup')
+  elif bc["quality"]["quality_gap_pct"] < 0 and bc["speed"]["speedup"] > 1:
+    print('  ✓✓ BD3-LM is BETTER on both quality AND speed (Pareto improvement!)')
+  elif bc["latency"]["latency_improvement"] > 2 and bc["quality"]["quality_competitive"]:
+    print('  ✓ BD3-LM excels at latency—ideal for interactive applications')
+  elif bc["speed"]["speedup"] > 2 and bc["quality"]["quality_gap_pct"] < 20:
+    print('  BD3-LM trades some quality for substantial speed—suitable for use cases where speed matters')
+  else:
+    print(' Tradeoffs unclear—may need hyperparameter tuning or larger block size')
+  
+  if fm["summary"]["introduces_new_failure_modes"]:
+    print(' Parallelization introduces failure modes—needs further investigation')
+  
+  print()
+  
+  return results
+
+
+def _multi_block_size_comparison(config, logger, tokenizer):
+  """
+  Compare AR with multiple BD3-LM block sizes to show interpolation.
+  This validates the core BD3-LM hypothesis.
+  
+  Usage: python main.py mode=multi_block_size_comparison \
+              eval.ar_checkpoint_path=<ar_path> \
+              eval.block_sizes=[1,4,8,16,32]
+  """
+  logger.info('Starting Multi-Block-Size Comparison with AR.')
+  
+  device = 'cuda' if torch.cuda.is_available() else 'cpu'
+  num_samples = config.eval.get('num_samples', 30)
+  block_sizes = config.eval.get('block_sizes', [1, 4, 8, 16])
+  
+  results = {'block_size_comparisons': []}
+  
+  # Generate AR samples once
+  logger.info('Generating AR baseline samples...')
+  ar_checkpoint = config.eval.get('ar_checkpoint_path')
+  config_ar = config.copy()
+  config_ar.eval.checkpoint_path = ar_checkpoint
+  config_ar.block_size = config.model.length
+  
+  ar_model = _load_from_checkpoint(config=config_ar, tokenizer=tokenizer)
+  ar_model.eval()
+  
+  ar_samples = []
+  ar_times = []
+  batch_size = config.loader.eval_batch_size
+  num_batches = (num_samples + batch_size - 1) // batch_size
+  
+  for _ in tqdm(range(num_batches), desc='AR'):
+    start = time.time()
+    batch = ar_model.restore_model_and_sample(num_steps=config.algo.T, seqlen=config.model.length)
+    elapsed = time.time() - start
+    
+    if isinstance(batch, list):
+      ar_samples.extend(batch)
+      ar_times.extend([elapsed/len(batch)] * len(batch))
+    else:
+      ar_samples.append(batch)
+      ar_times.append(elapsed)
+    
+    if len(ar_samples) >= num_samples:
+      break
+  
+  ar_samples = ar_samples[:num_samples]
+  ar_times = ar_times[:num_samples]
+  
+  # Compare each block size
+  for bs in block_sizes:
+    logger.info(f'\n{"="*60}')
+    logger.info(f'Evaluating Block Size = {bs}')
+    logger.info(f'{"="*60}')
+    
+    config.block_size = bs
+    checkpoint_pattern = config.eval.get('checkpoint_pattern', 
+                                         'kuleshov-group/bd3lm-owt-block_size{bs}')
+    config.eval.checkpoint_path = checkpoint_pattern.format(bs=bs)
+    
+    # Generate BD3-LM samples
+    bd3lm_model = _load_from_checkpoint(config=config, tokenizer=tokenizer)
+    bd3lm_model.eval()
+    
+    bd3lm_samples = []
+    bd3lm_times = []
+    
+    for _ in tqdm(range(num_batches), desc=f'BS={bs}'):
+      start = time.time()
+      batch = bd3lm_model.restore_model_and_sample(num_steps=config.algo.T, seqlen=config.model.length)
+      elapsed = time.time() - start
+      
+      if isinstance(batch, list):
+        bd3lm_samples.extend(batch)
+        bd3lm_times.extend([elapsed/len(batch)] * len(batch))
+      else:
+        bd3lm_samples.append(batch)
+        bd3lm_times.append(elapsed)
+      
+      if len(bd3lm_samples) >= num_samples:
+        break
+    
+    bd3lm_samples = bd3lm_samples[:num_samples]
+    bd3lm_times = bd3lm_times[:num_samples]
+    
+    # Compare
+    comparison = bd3lm_model.metrics.record_ar_baseline_comparison(
+        bd3lm_samples=bd3lm_samples,
+        ar_samples=ar_samples,
+        bd3lm_times=bd3lm_times,
+        ar_times=ar_times,
+        block_size=bs,
+        model_length=config.model.length,
+        device=device
+    )
+    
+    comparison['block_size'] = bs
+    results['block_size_comparisons'].append(comparison)
+  
+  # Save results
+  output_dir = Path('results')
+  output_dir.mkdir(exist_ok=True)
+  output_file = output_dir / 'multi_blocksize_ar_comparison.json'
+  
+  with open(output_file, 'w') as f:
+    json.dump(results, f, indent=2)
+  
+  # Visualization summary
+  print('\n' + '='*80)
+  print('INTERPOLATION ANALYSIS: BD3-LM Block Sizes vs AR')
+  print('='*80)
+  print(f'\n{"Block Size":<12} {"PPL":<8} {"Speedup":<10} {"TTFB (ms)":<12} {"Quality Gap %":<15}')
+  print('-'*80)
+  
+  for comp in results['block_size_comparisons']:
+    bs = comp['block_size']
+    ppl = comp['quality']['bd3lm_ppl']
+    speedup = comp['speed']['speedup']
+    ttfb = comp['latency']['bd3lm_ttfb_ms']
+    gap = comp['quality']['quality_gap_pct']
+    
+    print(f'{bs:<12} {ppl:<8.2f} {speedup:<10.2f} {ttfb:<12.1f} {gap:<15.1f}')
+  
+  # Add AR row for reference
+  ar_comp = results['block_size_comparisons'][0]  # Get AR metrics from first comparison
+  print('-'*80)
+  print(f'{"AR (ref)":<12} {ar_comp["quality"]["ar_ppl"]:<8.2f} {"1.00":<10} '
+        f'{ar_comp["latency"]["ar_ttfb_ms"]:<12.1f} {"0.0":<15}')
+  
+  print('='*80)
+  
+  # Analysis
+  block_sizes_arr = np.array([c['block_size'] for c in results['block_size_comparisons']])
+  speedups = np.array([c['speed']['speedup'] for c in results['block_size_comparisons']])
+  ppls = np.array([c['quality']['bd3lm_ppl'] for c in results['block_size_comparisons']])
+  
+  print('\n💡 INTERPOLATION INSIGHTS:')
+  print(f'  Quality trend: {"↓ Improves" if np.corrcoef(block_sizes_arr, ppls)[0,1] < 0 else "↑ Degrades"} with larger blocks')
+  print(f'  Speed trend: {"↓ Decreases" if np.corrcoef(block_sizes_arr, speedups)[0,1] < 0 else "↑ Increases"} with larger blocks')
+  print(f'  Validates interpolation hypothesis: '
+        f'{" YES" if np.corrcoef(block_sizes_arr, ppls)[0,1] < 0 and np.corrcoef(block_sizes_arr, speedups)[0,1] < 0 else "  PARTIAL"}')
+  print()
+  
+  return results
+
 def _train(config, logger, tokenizer):
   logger.info('Starting Training.')
   wandb_logger = None
@@ -762,6 +1156,12 @@ def main(config):
   elif config.mode == 'length_robustness_eval':
     config.wandb = None
     results = _length_robustness_eval(config, logger, tokenizer)
+  elif config.mode == 'ar_comparison_eval':
+    config.wandb = None
+    results = _ar_comparison_eval(config, logger, tokenizer)
+  elif config.mode == 'multi_block_size_comparison':
+    config.wandb = None
+    results = _multi_block_size_comparison(config, logger, tokenizer)
   else:
     _train(config, logger, tokenizer)
 

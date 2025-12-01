@@ -6,7 +6,7 @@ defaults:
   - /strategy: ddp
   - /noise: loglinear
   - /lr_scheduler: constant_warmup
-  - /algo: bd3lm
+  - /algo: ar
 
 mode: sample_eval  # train / ppl_eval / sample_eval
 diffusion: absorbing_state
@@ -54,6 +54,9 @@ eval:
   num_samples: 50 
   T_values: []
   test_lengths: []
+  ar_checkpoint_path: "kuleshov-group/ar-noeos-owt"
+  block_sizes: [1, 4, 8, 16]  # For multi-block-size comparison
+  checkpoint_pattern: "kuleshov-group/bd3lm-owt-block_size{bs}"
 
 optim:
   weight_decay: 0
