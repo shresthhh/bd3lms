@@ -1286,19 +1286,18 @@ class Diffusion(L.LightningModule):
           per_token_entropy = -(probs_clamped * probs_clamped.log()).sum(dim=-1)
           block_entropy = per_token_entropy.mean().item()
           
-          # Determine early exit based on entropy (skip for first block which already uses fewer steps)
+          # Determine early exit based on entropy
           # Max entropy for GPT-2 vocab (~50k) is ~10.8 nats
-          if stride_num > 0:  # Don't apply entropy-based exit to first block
-            if block_entropy <= 3.0:
-              early_exit_step = max(1, block_num_steps // 4)  # Very confident: 25% of steps
-            elif block_entropy <= 5.0:
-              early_exit_step = max(1, block_num_steps // 2)  # Confident: 50% of steps
-            elif block_entropy <= 7.0:
-              early_exit_step = max(1, int(block_num_steps * 0.75))  # Moderate: 75% of steps
-            # else: use all steps
+          if block_entropy <= 3.0:
+            early_exit_step = max(1, num_steps // 4)  # Very confident: 25% of steps
+          elif block_entropy <= 5.0:
+            early_exit_step = max(1, num_steps // 2)  # Confident: 50% of steps
+          elif block_entropy <= 7.0:
+            early_exit_step = max(1, int(num_steps * 0.75))  # Moderate: 75% of steps
+          # else: use all steps
           
           if stride_num < 5 or stride_num % 10 == 0:
-            print(f"Block {stride_num}: entropy={block_entropy:.3f}, early_exit={early_exit_step}/{block_num_steps}")
+            print(f"Block {stride_num}: entropy={block_entropy:.3f}, early_exit={early_exit_step}/{num_steps}")
         
         # Early exit if entropy-based stopping
         if early_exit_step is not None and i >= early_exit_step:
