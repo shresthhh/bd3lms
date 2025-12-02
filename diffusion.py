@@ -10,6 +10,7 @@ import transformers
 from tqdm import tqdm
 from collections import OrderedDict
 import os
+from pathlib import Path 
 
 import dataloader
 import metrics
@@ -790,22 +791,28 @@ class Diffusion(L.LightningModule):
         block_entropy = float('inf')
 
       adjusted = num_steps
-      if block_entropy <= 2.0:
+      if block_entropy <= 4.0:
         adjusted = max(1, int(num_steps // 2))
-      if block_entropy > 2.0 & block_entropy <= 3.0:
+      if block_entropy > 4.0 & block_entropy <= 6.0:
         adjusted = max(1, int(num_steps // 1.5))
       
 
-      # log to file for debugging (append mode) in outputs/
-      try:
-        os.makedirs('outputs', exist_ok=True)
-        log_path = os.path.join('outputs', 'blockEntropy.txt')
-        with open(log_path, 'a') as fh:
-          fh.write(f"block_entropy={block_entropy:.6f}, original_num_steps={num_steps}, adjusted_num_steps={adjusted}\n")
-          fh.flush()
-      except Exception:
-        # ignore logging errors
-        pass
+      output_dir = Path('steps')
+      output_dir.mkdir(exist_ok=True)
+      output_file = output_dir / f'blockEntropy.txt'
+      with open(output_file, 'a') as fh:
+        fh.write(f"block_entropy={block_entropy:.6f}, original_num_steps={num_steps}, adjusted_num_steps={adjusted}\n")
+        fh.flush()
+
+      # try:
+      #   os.makedirs('steps', exist_ok=True)
+      #   log_path = os.path.join('steps', 'blockEntropy.txt')
+      #   with open(log_path, 'a') as fh:
+      #     fh.write(f"block_entropy={block_entropy:.6f}, original_num_steps={num_steps}, adjusted_num_steps={adjusted}\n")
+      #     fh.flush()
+      # except Exception:
+      #   # ignore logging errors
+      #   pass
 
       return adjusted
     except Exception:
