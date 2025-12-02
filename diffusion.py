@@ -593,6 +593,7 @@ class Diffusion(L.LightningModule):
     move_chance_s = move_chance_s[:, None]
     mask_prob = move_chance_s / move_chance_t
 
+    p_x0_fresh = None  # Track freshly computed p_x0
     if p_x0 is None:
       if self.config.sampling.kv_cache:
         p_x0 = self.forward(x[:, -self.block_size:],
@@ -605,6 +606,7 @@ class Diffusion(L.LightningModule):
         p_x0 = p_x0[:, -self.block_size:]
       p_x0 = p_x0.exp()
       p_x0 = self._nucleus_sample(p_x0)
+      p_x0_fresh = p_x0  # Save for entropy computation
 
     if self.config.sampling.first_hitting:
       x_block = _sample_categorical(p_x0)
@@ -637,9 +639,9 @@ class Diffusion(L.LightningModule):
       _ = self.forward(x_block, sigma_t, sample_mode=True, store_kv=True)
 
     if not torch.allclose(x_new, x):
-      return None, x_new
+      return None, x_new, p_x0_fresh
     else:
-      return p_x0, x_new
+      return p_x0, x_new, p_x0_fresh
 
   @torch.no_grad()
   def _ar_sampler(self, bsz, context_len=1024):
@@ -1265,7 +1267,7 @@ class Diffusion(L.LightningModule):
         elif not self.config.sampling.first_hitting:
           t = timesteps[i]
 
-        p_x0_cache, x_next = self._ddpm_caching_update(
+        p_x0_cache, x_next, p_x0_fresh = self._ddpm_caching_update(
             x=x_accum[:, fwd_idx],
             t=t * ones,
             dt=dt,
@@ -1276,38 +1278,27 @@ class Diffusion(L.LightningModule):
           if self._benchmark_enabled and self.benchmark:
             self.benchmark.record_diffusion_step()
         
-        # Compute entropy at first step by doing a forward pass
-        if i == 0:
-          # Get probabilities from a forward pass
-          _, move_chance_t = self.noise(t * ones)
-          sigma_t = self._sigma_from_p(move_chance_t)
-          if self.config.sampling.kv_cache:
-            p_x0_for_entropy = self.forward(
-              x_accum[:, fwd_idx][:, -self.block_size:],
-              sigma_t, sample_mode=True).to(torch.float64).exp()
-          else:
-            p_x0_for_entropy = self.forward(
-              x_accum[:, fwd_idx], sigma_t, sample_mode=True
-            ).to(torch.float64)[:, -self.block_size:].exp()
-          
-          # Compute per-token entropy
+        # Compute entropy at first step using the freshly computed p_x0 (no extra forward pass!)
+        if i == 0 and p_x0_fresh is not None:
+          # Compute per-token entropy from the probability distribution
           eps = 1e-12
-          probs_clamped = p_x0_for_entropy.clamp(min=eps)
+          probs_clamped = p_x0_fresh.clamp(min=eps)
           per_token_entropy = -(probs_clamped * probs_clamped.log()).sum(dim=-1)
           block_entropy = per_token_entropy.mean().item()
           
-          # Determine early exit based on entropy
+          # Determine early exit based on entropy (skip for first block which already uses fewer steps)
           # Max entropy for GPT-2 vocab (~50k) is ~10.8 nats
-          if block_entropy <= 3.0:
-            early_exit_step = max(1, num_steps // 4)  # Very confident: 25% of steps
-          elif block_entropy <= 5.0:
-            early_exit_step = max(1, num_steps // 2)  # Confident: 50% of steps
-          elif block_entropy <= 7.0:
-            early_exit_step = max(1, int(num_steps * 0.75))  # Moderate: 75% of steps
-          # else: use all steps
+          if stride_num > 0:  # Don't apply entropy-based exit to first block
+            if block_entropy <= 3.0:
+              early_exit_step = max(1, block_num_steps // 4)  # Very confident: 25% of steps
+            elif block_entropy <= 5.0:
+              early_exit_step = max(1, block_num_steps // 2)  # Confident: 50% of steps
+            elif block_entropy <= 7.0:
+              early_exit_step = max(1, int(block_num_steps * 0.75))  # Moderate: 75% of steps
+            # else: use all steps
           
           if stride_num < 5 or stride_num % 10 == 0:
-            print(f"Block {stride_num}: entropy={block_entropy:.3f}, early_exit={early_exit_step}/{num_steps}")
+            print(f"Block {stride_num}: entropy={block_entropy:.3f}, early_exit={early_exit_step}/{block_num_steps}")
         
         # Early exit if entropy-based stopping
         if early_exit_step is not None and i >= early_exit_step:
