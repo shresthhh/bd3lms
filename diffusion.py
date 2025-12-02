@@ -1,4 +1,5 @@
 import itertools
+import traceback
 from dataclasses import dataclass
 
 import hydra.utils
@@ -705,17 +706,14 @@ class Diffusion(L.LightningModule):
       return self.tokenizer.batch_decode(samples)
     if self.sampler == 'semi_ar':
       for _ in range(self.config.sampling.num_sample_batches):
-        # adjust num_steps based on block entropy
-        effective_num_steps = self._compute_num_steps_from_block_entropy(
-          num_steps, batch_size_per_gpu=batch_size_per_gpu)
-
         sample_i, num_tries = None, 0
         while sample_i is None:
           num_tries += 1
+          # Pass base num_steps; per-block adjustment happens inside _semi_ar_sampler
           sample_i, nfes = self._semi_ar_sampler(
             n_samples=batch_size_per_gpu,
             num_strides=(seqlen // self.block_size), 
-            num_steps=effective_num_steps,
+            num_steps=num_steps,
             seqlen=seqlen)
           if num_tries > 10:
             raise ValueError('Sampling failed.')
@@ -764,6 +762,7 @@ class Diffusion(L.LightningModule):
 
     probe_bs = 1 if batch_size_per_gpu is None else max(1, int(batch_size_per_gpu))
     try:
+      print(f"Computing block entropy for {probe_bs} samples")
       # Build a masked probe block
       x_probe = torch.full((probe_bs, self.block_size), self.mask_index, dtype=torch.long, device=self.device)
       if self.tokenizer is not None and self.block_size > 0:
@@ -773,35 +772,41 @@ class Diffusion(L.LightningModule):
       _, p_probe = self.noise(torch.ones((probe_bs, 1), device=self.device))
       sigma_probe = self._sigma_from_p(p_probe[:, 0].unsqueeze(-1))
 
-      model_out = self.forward(x_probe, sigma_probe)
+      print(f"Forward pass for {probe_bs} samples")
+      model_out = self.forward(x_probe, sigma_probe, sample_mode=True)
       # convert to probabilities
       if model_out.dtype.is_floating_point:
         probs = model_out.exp()
       else:
         probs = model_out.to(torch.float32).exp()
 
+      print(f"Clamping probabilities for {probe_bs} samples")
       eps = 1e-12
       probs_clamped = probs.clamp(min=eps)
       per_token_entropy = -(probs_clamped * probs_clamped.log()).sum(dim=-1)
 
+      print(f"Computing block entropy for {probe_bs} samples")
       masked_mask = (x_probe == self.mask_index)
       if masked_mask.any():
         block_entropy = per_token_entropy[masked_mask].mean().item()
       else:
         block_entropy = float('inf')
 
+      print(f"Adjusting num_steps based on block entropy for {probe_bs} samples")
       adjusted = num_steps
       if block_entropy <= 4.0:
         adjusted = max(1, int(num_steps // 2))
-      if block_entropy > 4.0 & block_entropy <= 6.0:
+      if block_entropy > 4.0 and block_entropy <= 6.0:
         adjusted = max(1, int(num_steps // 1.5))
       
-
+      print(f"Writing to file for {probe_bs} samples")
       output_dir = Path('steps')
       output_dir.mkdir(exist_ok=True)
       output_file = output_dir / f'blockEntropy.txt'
+      print(f"block_entropy={block_entropy:.6f}, original_num_steps={num_steps}, adjusted_num_steps={adjusted}")
       with open(output_file, 'a') as fh:
         fh.write(f"block_entropy={block_entropy:.6f}, original_num_steps={num_steps}, adjusted_num_steps={adjusted}\n")
+        print("File written to steps/blockEntropy.txt - {output_file}")
         fh.flush()
 
       # try:
@@ -815,12 +820,93 @@ class Diffusion(L.LightningModule):
       #   pass
 
       return adjusted
-    except Exception:
+    except Exception as e:
       # If probing fails for any reason, return original value
+      print(f"Probing failed for {probe_bs} samples, returning original value")
+      print(f"num_steps={num_steps}")
+      print(f"Exception: {e}")
+      print(f"traceback: {traceback.format_exc()}")
       return num_steps
 
   def _sigma_from_p(self, p):
     return torch.min(- torch.log(1 - p), self.noise.sigma_max)
+
+  @torch.no_grad()
+  def _compute_block_entropy_with_context(self, context, num_steps):
+    """Compute adjusted num_steps for a block given context.
+    
+    Args:
+      context: Tensor of shape (batch, seq_len) with already generated tokens.
+               Can be None for the first block.
+      num_steps: Base number of denoising steps.
+    
+    Returns:
+      Adjusted number of steps based on entropy.
+    """
+    try:
+      n_samples = context.shape[0] if context is not None else 1
+      
+      # Create masked block to append
+      masked_block = torch.full(
+        (n_samples, self.block_size), 
+        self.mask_index, 
+        dtype=torch.long, 
+        device=self.device
+      )
+      
+      # Build probe input: context + masked block
+      if context is None or context.shape[1] == 0:
+        # First block: just BOS + masked tokens
+        x_probe = masked_block.clone()
+        x_probe[:, 0] = self.tokenizer.bos_token_id
+      else:
+        # Subsequent blocks: context + masked block
+        x_probe = torch.cat([context, masked_block], dim=1)
+      
+      # Get sigma for t=1
+      _, p_probe = self.noise(torch.ones((n_samples, 1), device=self.device))
+      sigma_probe = self._sigma_from_p(p_probe[:, 0].unsqueeze(-1))
+      
+      # Forward pass with context
+      model_out = self.forward(x_probe, sigma_probe, sample_mode=True)
+      
+      # Only look at the last block_size positions (the masked block)
+      block_logits = model_out[:, -self.block_size:, :]
+      
+      # Convert to probabilities
+      if block_logits.dtype.is_floating_point:
+        probs = block_logits.exp()
+      else:
+        probs = block_logits.to(torch.float32).exp()
+      
+      # Compute entropy
+      eps = 1e-12
+      probs_clamped = probs.clamp(min=eps)
+      per_token_entropy = -(probs_clamped * probs_clamped.log()).sum(dim=-1)
+      
+      # Average entropy over masked tokens (exclude BOS if first block)
+      if context is None or context.shape[1] == 0:
+        # First block: skip position 0 (BOS)
+        block_entropy = per_token_entropy[:, 1:].mean().item()
+      else:
+        block_entropy = per_token_entropy.mean().item()
+      
+      # Adjust steps based on entropy
+      # Max entropy for GPT-2 vocab (~50k) is ~10.8 nats
+      adjusted = num_steps
+      if block_entropy <= 4.0:
+        adjusted = max(1, int(num_steps // 2))
+      elif block_entropy <= 6.0:
+        adjusted = max(1, int(num_steps // 1.5))
+      elif block_entropy <= 7.5:
+        adjusted = max(1, int(num_steps * 0.8))
+      # else: keep original num_steps
+      
+      return adjusted, block_entropy
+      
+    except Exception as e:
+      # On failure, return original steps
+      return num_steps, float('inf')
 
   def restore_model_and_sample(self, num_steps, eps=1e-5, seqlen=None):
     """Generate samples from the model."""
@@ -1160,6 +1246,10 @@ class Diffusion(L.LightningModule):
       p_x0_cache = None
       timesteps = torch.linspace(1, 0, num_steps, device=self.device)
       t = 1
+      block_entropy = None
+      early_exit_step = None
+      actual_steps_used = num_steps  # Default to full steps
+      
       for i in range(num_steps):
         if self.mask_index not in x_accum:
           break
@@ -1185,13 +1275,60 @@ class Diffusion(L.LightningModule):
           # Record diffusion step for benchmark
           if self._benchmark_enabled and self.benchmark:
             self.benchmark.record_diffusion_step()
+        
+        # Compute entropy at first step by doing a forward pass
+        if i == 0:
+          # Get probabilities from a forward pass
+          _, move_chance_t = self.noise(t * ones)
+          sigma_t = self._sigma_from_p(move_chance_t)
+          if self.config.sampling.kv_cache:
+            p_x0_for_entropy = self.forward(
+              x_accum[:, fwd_idx][:, -self.block_size:],
+              sigma_t, sample_mode=True).to(torch.float64).exp()
+          else:
+            p_x0_for_entropy = self.forward(
+              x_accum[:, fwd_idx], sigma_t, sample_mode=True
+            ).to(torch.float64)[:, -self.block_size:].exp()
+          
+          # Compute per-token entropy
+          eps = 1e-12
+          probs_clamped = p_x0_for_entropy.clamp(min=eps)
+          per_token_entropy = -(probs_clamped * probs_clamped.log()).sum(dim=-1)
+          block_entropy = per_token_entropy.mean().item()
+          
+          # Determine early exit based on entropy
+          # Max entropy for GPT-2 vocab (~50k) is ~10.8 nats
+          if block_entropy <= 3.0:
+            early_exit_step = max(1, num_steps // 4)  # Very confident: 25% of steps
+          elif block_entropy <= 5.0:
+            early_exit_step = max(1, num_steps // 2)  # Confident: 50% of steps
+          elif block_entropy <= 7.0:
+            early_exit_step = max(1, int(num_steps * 0.75))  # Moderate: 75% of steps
+          # else: use all steps
+          
+          if stride_num < 5 or stride_num % 10 == 0:
+            print(f"Block {stride_num}: entropy={block_entropy:.3f}, early_exit={early_exit_step}/{num_steps}")
+        
+        # Early exit if entropy-based stopping
+        if early_exit_step is not None and i >= early_exit_step:
+          actual_steps_used = i + 1
+          break
        
         x_accum[:, fwd_idx] = x_next
+      else:
+        # Loop completed without early exit
+        actual_steps_used = num_steps
 
       # End block timing and record metrics
       if self._benchmark_enabled and self.benchmark:
         block_tokens = x_accum[:, -self.block_size:].flatten()
-        self.benchmark.end_block(block_tokens)
+        # Override num_diffusion_steps with actual steps used
+        self.benchmark._diffusion_steps_in_block = actual_steps_used
+        self.benchmark.end_block(
+          block_tokens,
+          prediction_entropy=block_entropy if block_entropy is not None else 0.0,
+          early_exit_step=early_exit_step if early_exit_step is not None else 0
+        )
 
       # check if we need to resample (or stop sampling for variable-length sampling)
       if x_accum.shape[1] > 256:

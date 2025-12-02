@@ -23,6 +23,8 @@ class BlockMetrics:
     is_coherent: bool = False
     entropy: float = 0.0
     tokens_unmasked: int = 0
+    prediction_entropy: float = 0.0  # Model's prediction entropy at step 0
+    early_exit_step: int = 0  # Step at which early exit was triggered (0 = no early exit)
 
 
 @dataclass 
@@ -110,13 +112,21 @@ class InferenceBenchmark:
         """Call after each diffusion step within a block."""
         self._diffusion_steps_in_block += 1
     
-    def end_block(self, block_tokens: torch.Tensor, is_coherent: bool = False):
-        """Call at the end of each block generation."""
+    def end_block(self, block_tokens: torch.Tensor, is_coherent: bool = False,
+                  prediction_entropy: float = 0.0, early_exit_step: int = 0):
+        """Call at the end of each block generation.
+        
+        Args:
+            block_tokens: Generated tokens for this block
+            is_coherent: Whether the block is coherent
+            prediction_entropy: Model's prediction entropy at step 0 (for early exit decisions)
+            early_exit_step: Step at which early exit was triggered (0 = no early exit)
+        """
         end_time = time.perf_counter()
         start_time = self._block_start or end_time
         duration_ms = (end_time - start_time) * 1000
         
-        # Calculate entropy for this block
+        # Calculate entropy for this block (from final tokens)
         if block_tokens is not None and len(block_tokens) > 0:
             _, counts = torch.unique(block_tokens, return_counts=True, sorted=False)
             entropy = torch.special.entr(counts.float() / counts.sum()).sum().item()
@@ -137,6 +147,8 @@ class InferenceBenchmark:
             is_coherent=is_coherent,
             entropy=entropy,
             tokens_unmasked=tokens_unmasked,
+            prediction_entropy=prediction_entropy,
+            early_exit_step=early_exit_step,
         )
         self._block_metrics.append(block_metric)
         
