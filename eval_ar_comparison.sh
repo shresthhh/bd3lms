@@ -14,6 +14,7 @@ python -u main.py \
   loader.eval_batch_size=8 \
   model=small \
   algo=bd3lm \
+  sampling.nucleus_p=0.9\
   algo.T=5000 \
   algo.backbone=hf_dit \
   data=openwebtext-split \
